@@ -13,6 +13,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.background
@@ -37,10 +38,25 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.IntOffset
+import kotlin.math.abs
+import kotlin.math.roundToInt
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -63,11 +79,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.zIndex
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.amresalehin.emregallery.data.LinkMetadataFetcher
 import com.amresalehin.emregallery.data.MediaClassifier
+import com.amresalehin.emregallery.data.MediaInboxItem
 import com.amresalehin.emregallery.data.MediaInboxStack
 import com.amresalehin.emregallery.data.PocketRepository
 import kotlinx.coroutines.launch
@@ -115,13 +137,13 @@ object PocketThemeColors {
         if (isDark) Color(0xFFEDEDED) else Color(0xFFFFFFFF)
 
     fun stackLayer1(isDark: Boolean): Color =
-        if (isDark) Color(0xFF141414) else Color(0xFFE2E2E2)
+        if (isDark) Color(0xFF18161D) else Color(0xFFEAE5ED)
 
     fun stackLayer2(isDark: Boolean): Color =
-        if (isDark) Color(0xFF1C1C1C) else Color(0xFFECECEC)
+        if (isDark) Color(0xFF1E1C22) else Color(0xFFFFFFFF)
 
     fun stackFront(isDark: Boolean): Color =
-        if (isDark) Color(0xFF242424) else Color(0xFFFFFFFF)
+        if (isDark) Color(0xFF26242C) else Color(0xFFE6E0E9)
 
     fun webGradient(isDark: Boolean): List<Color> =
         if (isDark) listOf(Color(0xFF222222), Color(0xFF181818))
@@ -143,6 +165,20 @@ object PocketThemeColors {
         if (isDark) Color(0xFF282828) else Color(0xFFECECEC)
 }
 
+fun parseDimensionsFromText(text: String): Pair<Int?, Int?> {
+    val match = Regex("""(\d{2,5})\s*[xX*×]\s*(\d{2,5})""").find(text)
+    if (match != null) {
+        val w = match.groupValues[1].toIntOrNull()
+        val h = match.groupValues[2].toIntOrNull()
+        return w to h
+    }
+    return null to null
+}
+
+fun parseMediaItemDimensions(item: MediaInboxItem): Pair<Int?, Int?> {
+    return parseDimensionsFromText("${item.title} ${item.sourceUrl}")
+}
+
 /**
  * Pocket Screen
  * Displays saved bookmarks and web collections in a clean, modern staggered masonry layout.
@@ -159,6 +195,7 @@ fun PocketScreen(
     onMenuClick: () -> Unit = {},
     onDetailViewerStateChange: ((Boolean) -> Unit)? = null,
     onOpenDiscoveredMedia: () -> Unit = {},
+    onOpenBookmarkDetail: (MediaInboxStack) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -177,12 +214,19 @@ fun PocketScreen(
 
     var sortOrder by remember { mutableStateOf("Newest") } // Newest, Oldest, Title, Domain
     var filterType by remember { mutableStateOf("All") } // All, Web Links, Notes
+    val showSvg by pocketRepo.showSvg.collectAsState()
+    val showVideos by pocketRepo.showVideos.collectAsState()
+    val showStreams by pocketRepo.showStreams.collectAsState()
+    val showPng by pocketRepo.showPng.collectAsState()
+    val showGif by pocketRepo.showGif.collectAsState()
+    val minWidth by pocketRepo.minWidth.collectAsState()
+    val minHeight by pocketRepo.minHeight.collectAsState()
+    val minSizeKb by pocketRepo.minSizeKb.collectAsState()
     var showFilterSheet by remember { mutableStateOf(false) }
 
     var showAddBookmarkDialog by remember { mutableStateOf(false) }
     var editingStack by remember { mutableStateOf<MediaInboxStack?>(null) }
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
-    var selectedStackForDetail by remember { mutableStateOf<MediaInboxStack?>(null) }
 
     var showFullScreenBrowser by remember { mutableStateOf(false) }
     var browserUrl by remember { mutableStateOf("") }
@@ -210,8 +254,28 @@ fun PocketScreen(
     }
 
     // Filter and sort stacks
-    val filteredStacks = remember(stacks, searchQuery, sortOrder, filterType) {
-        var result = stacks.filter { stack ->
+    val filteredStacks = remember(
+        stacks, searchQuery, sortOrder, filterType,
+        showSvg, showVideos, showStreams, showPng, showGif,
+        minWidth, minHeight, minSizeKb
+    ) {
+        // When type filters, dimensions, or size are set, hide non-compliant media items from found media
+        // within the bookmark stack, displaying the bookmark itself and remaining compliant media items.
+        val sanitized = stacks.map { stack ->
+            pocketRepo.sanitizeStack(
+                stack = stack,
+                showSvg = showSvg,
+                minWidth = minWidth,
+                minHeight = minHeight,
+                showVideos = showVideos,
+                showStreams = showStreams,
+                showPng = showPng,
+                showGif = showGif,
+                minSizeKb = minSizeKb
+            )
+        }
+
+        var result = sanitized.filter { stack ->
             val matchesQuery = if (searchQuery.isBlank()) {
                 true
             } else {
@@ -240,23 +304,10 @@ fun PocketScreen(
         result
     }
 
-    LaunchedEffect(selectedStackForDetail) {
-        onDetailViewerStateChange?.invoke(selectedStackForDetail != null)
-    }
-    DisposableEffect(Unit) {
-        onDispose {
-            onDetailViewerStateChange?.invoke(false)
-        }
-    }
-
-    // Handle back button
-    BackHandler(enabled = !showFullScreenBrowser && (selectedStackForDetail != null || isSelectionMode || isSearchFocused || searchQuery.isNotEmpty() || showFilterSheet)) {
+    // Handle back button for in-screen states (browser, selection, search, filter)
+    BackHandler(enabled = !showFullScreenBrowser && (isSelectionMode || isSearchFocused || searchQuery.isNotEmpty() || showFilterSheet)) {
         when {
             showFullScreenBrowser -> showFullScreenBrowser = false
-            selectedStackForDetail != null -> {
-                selectedStackForDetail = null
-                onDetailViewerStateChange?.invoke(false)
-            }
             isSelectionMode -> selectedStackIds = emptySet()
             isSearchFocused || searchQuery.isNotEmpty() -> {
                 searchQuery = ""
@@ -323,7 +374,9 @@ fun PocketScreen(
                                             searchQuery.trim().startsWith("http://") ||
                                             searchQuery.trim().startsWith("https://")
                                     )
-                            val hasActiveFilters = filterType != "All" || sortOrder != "Newest"
+                            val hasActiveFilters = filterType != "All" || sortOrder != "Newest" || showSvg ||
+                                    !showVideos || !showStreams || !showPng || !showGif ||
+                                    minWidth != PocketRepository.DEFAULT_MIN_WIDTH || minHeight != PocketRepository.DEFAULT_MIN_HEIGHT || minSizeKb != PocketRepository.DEFAULT_MIN_SIZE_KB
 
                             PocketSearchPasteCapsule(
                                 query = searchQuery,
@@ -335,54 +388,65 @@ fun PocketScreen(
                                 hasActiveFilters = hasActiveFilters,
                                 onBookmarkAction = {
                                     val trimmed = searchQuery.trim()
-                                    if (trimmed.isNotBlank()) {
-                                        val domain = MediaClassifier.cleanDomainFromUrl(trimmed)
-                                        val saved = pocketRepo.addBookmark(
-                                            title = domain.ifBlank { trimmed },
-                                            url = trimmed
+                                    val liveClip = clipboardManager.primaryClip
+                                    val clipText = if (liveClip != null && liveClip.itemCount > 0) {
+                                        liveClip.getItemAt(0).text?.toString()?.trim() ?: ""
+                                    } else ""
+
+                                    val rawTarget = when {
+                                        trimmed.isNotBlank() -> trimmed
+                                        clipText.isNotBlank() -> clipText
+                                        else -> ""
+                                    }
+
+                                    if (rawTarget.isNotBlank()) {
+                                        val targetUrl = MediaClassifier.extractFirstUrl(rawTarget)
+                                            ?: if (rawTarget.contains(".") || rawTarget.startsWith("http://", ignoreCase = true) || rawTarget.startsWith("https://", ignoreCase = true) || rawTarget.startsWith("file://", ignoreCase = true) || rawTarget.startsWith("content://", ignoreCase = true)) {
+                                                MediaClassifier.sanitizeUrl(rawTarget)
+                                            } else {
+                                                rawTarget
+                                            }
+
+                                        val domain = MediaClassifier.cleanDomainFromUrl(targetUrl)
+                                        pocketRepo.addBookmark(
+                                            title = domain.ifBlank { targetUrl },
+                                            url = targetUrl
                                         )
                                         searchQuery = ""
                                         isSearchFocused = false
                                         focusManager.clearFocus()
                                         keyboardController?.hide()
-                                        selectedStackForDetail = saved
                                         scope.launch {
-                                            snackbarHostState.showSnackbar("Bookmark saved to Pocket")
-                                        }
-                                    } else if (clipboardUrl != null) {
-                                        val domain = MediaClassifier.cleanDomainFromUrl(clipboardUrl!!)
-                                        val saved = pocketRepo.addBookmark(
-                                            title = domain.ifBlank { clipboardUrl!! },
-                                            url = clipboardUrl!!
-                                        )
-                                        clipboardUrl = null
-                                        isSearchFocused = false
-                                        focusManager.clearFocus()
-                                        keyboardController?.hide()
-                                        selectedStackForDetail = saved
-                                        scope.launch {
-                                            snackbarHostState.showSnackbar("Bookmark saved from clipboard")
+                                            snackbarHostState.showSnackbar("Saved to Pocket")
                                         }
                                     } else {
-                                        showAddBookmarkDialog = true
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar("Enter or paste a media link or URL to save")
+                                        }
                                     }
                                 },
                                 onSearchSubmit = { target ->
                                     val trimmed = target.trim()
                                     if (trimmed.isNotBlank()) {
-                                        if (MediaClassifier.isValidWebUrl(trimmed) || trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-                                            val domain = MediaClassifier.cleanDomainFromUrl(trimmed)
-                                            val saved = pocketRepo.addBookmark(
-                                                title = domain.ifBlank { trimmed },
-                                                url = trimmed
+                                        val targetUrl = MediaClassifier.extractFirstUrl(trimmed)
+                                            ?: if (trimmed.contains(".") || trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true) || trimmed.startsWith("file://", ignoreCase = true) || trimmed.startsWith("content://", ignoreCase = true)) {
+                                                MediaClassifier.sanitizeUrl(trimmed)
+                                            } else {
+                                                ""
+                                            }
+
+                                        if (targetUrl.isNotBlank()) {
+                                            val domain = MediaClassifier.cleanDomainFromUrl(targetUrl)
+                                            pocketRepo.addBookmark(
+                                                title = domain.ifBlank { targetUrl },
+                                                url = targetUrl
                                             )
                                             searchQuery = ""
                                             isSearchFocused = false
                                             focusManager.clearFocus()
                                             keyboardController?.hide()
-                                            selectedStackForDetail = saved
                                             scope.launch {
-                                                snackbarHostState.showSnackbar("Bookmark saved to Pocket")
+                                                snackbarHostState.showSnackbar("Saved to Pocket")
                                             }
                                         } else {
                                             keyboardController?.hide()
@@ -429,8 +493,8 @@ fun PocketScreen(
                                             selectedStackIds + stack.id
                                         }
                                     } else {
-                                        // Clicking link opens a bookmark detail page as requested
-                                        selectedStackForDetail = stack
+                                        // Clicking bookmark opens a separate full screen bookmark detail page
+                                        onOpenBookmarkDetail(stack)
                                     }
                                 },
                                 onLongClick = {
@@ -452,41 +516,6 @@ fun PocketScreen(
                         modifier = Modifier.fillMaxSize()
                     )
                 }
-            }
-        }
-
-        // Bookmark Viewer / Detail Page matching image_a086dfff.png
-        AnimatedVisibility(
-            visible = selectedStackForDetail != null,
-            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
-            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
-            modifier = Modifier
-                .fillMaxSize()
-                .zIndex(50f)
-        ) {
-            selectedStackForDetail?.let { stack ->
-                PocketBookmarkViewerPage(
-                    stack = stack,
-                    onBack = {
-                        selectedStackForDetail = null
-                        onDetailViewerStateChange?.invoke(false)
-                    },
-                    onOpenBrowser = { url ->
-                        browserUrl = url
-                        showFullScreenBrowser = true
-                    },
-                    onDelete = {
-                        pocketRepo.deleteBookmark(stack.id)
-                        selectedStackForDetail = null
-                        onDetailViewerStateChange?.invoke(false)
-                        scope.launch {
-                            snackbarHostState.showSnackbar("Bookmark deleted")
-                        }
-                    },
-                    onEditNote = { editingStack = stack },
-                    isDark = isDark,
-                    modifier = Modifier.fillMaxSize()
-                )
             }
         }
 
@@ -513,14 +542,14 @@ fun PocketScreen(
         if (showAddBookmarkDialog) {
             AddBookmarkDialog(
                 onDismiss = { showAddBookmarkDialog = false },
-                onSave = { title, url, description ->
+                onSave = { title, url, description, previewUrl ->
                     val added = pocketRepo.addBookmark(
                         title = title,
                         url = url,
-                        description = description
+                        description = description,
+                        previewImageUrl = previewUrl
                     )
                     showAddBookmarkDialog = false
-                    selectedStackForDetail = added
                     scope.launch {
                         snackbarHostState.showSnackbar("Bookmark saved to Pocket")
                     }
@@ -534,15 +563,13 @@ fun PocketScreen(
             EditBookmarkDialog(
                 stack = stack,
                 onDismiss = { editingStack = null },
-                onSave = { updatedTitle, updatedDesc ->
+                onSave = { updatedTitle, updatedDesc, updatedPreview ->
                     val updated = stack.copy(
                         title = updatedTitle,
-                        description = updatedDesc
+                        description = updatedDesc,
+                        previewImageUrl = updatedPreview
                     )
                     pocketRepo.updateBookmark(updated)
-                    if (selectedStackForDetail?.id == stack.id) {
-                        selectedStackForDetail = updated
-                    }
                     editingStack = null
                     scope.launch {
                         snackbarHostState.showSnackbar("Bookmark updated")
@@ -608,8 +635,24 @@ fun PocketScreen(
             PocketFilterBottomSheet(
                 currentSort = sortOrder,
                 currentFilter = filterType,
+                showSvg = showSvg,
+                showVideos = showVideos,
+                showStreams = showStreams,
+                showPng = showPng,
+                showGif = showGif,
+                minWidth = minWidth,
+                minHeight = minHeight,
+                minSizeKb = minSizeKb,
                 onSelectSort = { sortOrder = it },
                 onSelectFilter = { filterType = it },
+                onToggleShowSvg = { pocketRepo.setShowSvg(it) },
+                onToggleShowVideos = { pocketRepo.setShowVideos(it) },
+                onToggleShowStreams = { pocketRepo.setShowStreams(it) },
+                onToggleShowPng = { pocketRepo.setShowPng(it) },
+                onToggleShowGif = { pocketRepo.setShowGif(it) },
+                onWidthChange = { pocketRepo.setMinWidth(it) },
+                onHeightChange = { pocketRepo.setMinHeight(it) },
+                onSizeChange = { pocketRepo.setMinSizeKb(it) },
                 onDismiss = { showFilterSheet = false },
                 isDark = isDark
             )
@@ -737,6 +780,16 @@ fun PocketSearchPasteCapsule(
                             if (query.isNotBlank()) {
                                 onSearchSubmit(query.trim())
                             }
+                        },
+                        onGo = {
+                            if (query.isNotBlank()) {
+                                onSearchSubmit(query.trim())
+                            }
+                        },
+                        onDone = {
+                            if (query.isNotBlank()) {
+                                onSearchSubmit(query.trim())
+                            }
                         }
                     )
                 )
@@ -749,22 +802,24 @@ fun PocketSearchPasteCapsule(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    // Cross (clear) button
-                    IconButton(
-                        onClick = { onQueryChange("") },
-                        modifier = Modifier
-                            .size(36.dp)
-                            .testTag("pocket_search_clear_btn")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Clear search",
-                            tint = secondaryText,
-                            modifier = Modifier.size(18.dp)
-                        )
+                    // Cross (clear) button only when text is present
+                    if (query.isNotEmpty()) {
+                        IconButton(
+                            onClick = { onQueryChange("") },
+                            modifier = Modifier
+                                .size(36.dp)
+                                .testTag("pocket_search_clear_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Clear search",
+                                tint = secondaryText,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
 
-                    // Bookmark icon button (monochrome theme)
+                    // Save / Bookmark icon button (monochrome theme)
                     IconButton(
                         onClick = onBookmarkAction,
                         modifier = Modifier
@@ -773,7 +828,7 @@ fun PocketSearchPasteCapsule(
                     ) {
                         Icon(
                             imageVector = Icons.Default.BookmarkAdd,
-                            contentDescription = "Save bookmark",
+                            contentDescription = "Save media to Pocket",
                             tint = textColor,
                             modifier = Modifier.size(22.dp)
                         )
@@ -944,15 +999,19 @@ fun PocketBookmarkStaggeredCard(
     }
 
     val firstMedia = stack.items.firstOrNull()
-    val mediaModel = remember(firstMedia) {
-        firstMedia?.let {
-            if (it.localUri.isNotBlank()) {
-                val f = File(it.localUri.removePrefix("file://"))
-                if (f.exists()) f else it.sourceUrl.ifBlank { it.localUri }
-            } else {
-                it.sourceUrl
+    val mediaModel = remember(firstMedia, stack.previewImageUrl) {
+        firstMedia?.let { item ->
+            val localFile = if (item.localUri.isNotBlank()) {
+                File(item.localUri.removePrefix("file://")).takeIf { it.exists() && it.length() > 0L }
+            } else null
+            when {
+                item.thumbnailUrl.isNotBlank() && (item.isVideo || item.isStream || localFile == null) -> item.thumbnailUrl
+                localFile != null -> localFile
+                item.thumbnailUrl.isNotBlank() -> item.thumbnailUrl
+                item.isVideo && stack.previewImageUrl.isNotBlank() -> stack.previewImageUrl
+                else -> item.sourceUrl.ifBlank { item.localUri }
             }
-        }
+        } ?: stack.previewImageUrl.takeIf { it.isNotBlank() }
     }
 
     val faviconUrl = remember(stack.sourceDomain) {
@@ -1002,6 +1061,22 @@ fun PocketBookmarkStaggeredCard(
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )
+                        if (stack.items.isEmpty()) {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = Color.Black.copy(alpha = 0.65f),
+                                modifier = Modifier
+                                    .align(Alignment.BottomStart)
+                                    .padding(8.dp)
+                            ) {
+                                Text(
+                                    text = "Preview",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                                    color = Color.White,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
                     } else if (faviconUrl.isNotBlank()) {
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
@@ -1093,6 +1168,20 @@ fun PocketBookmarkStaggeredCard(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
+
+                    if (stack.description.isNotBlank()) {
+                        Spacer(Modifier.height(3.dp))
+                        Text(
+                            text = stack.description,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontSize = 12.sp,
+                                lineHeight = 16.sp
+                            ),
+                            color = secondaryText,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
 
                     Spacer(Modifier.height(3.dp))
 
@@ -1195,534 +1284,6 @@ fun PocketBookmarkStaggeredCard(
 }
 
 /**
- * Bookmark Viewer / Detail Page conforming strictly to image_a086dfff.png
- * Features:
- * - Top Bar: Circular Back button on left, 3 circular buttons on right (Reader/Browser, Copy, Delete)
- * - Center visual: Layered card stack deck with image/cover and `[🖼️ X / Y]` pagination badge
- * - Bottom sheet: Drag handle + rounded capsule cards for:
- *   1. 📅 Time
- *   2. 🔗 Source (clickable with open icon)
- *   3. 📄 Note (clickable to edit)
- *   4. 🏷️ Tags (chips of domain/type)
- *   5. ≡ Title
- *   6. ≡ Description
- */
-@Composable
-fun PocketBookmarkViewerPage(
-    stack: MediaInboxStack,
-    onBack: () -> Unit,
-    onOpenBrowser: (String) -> Unit,
-    onDelete: () -> Unit,
-    onEditNote: () -> Unit,
-    isDark: Boolean = false,
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    val textColor = PocketThemeColors.primaryText(isDark)
-    val secondaryText = PocketThemeColors.secondaryText(isDark)
-    val cardSurface = PocketThemeColors.stackFront(isDark)
-    val barSurface = PocketThemeColors.barSurface(isDark)
-    val dividerCol = PocketThemeColors.divider(isDark)
-
-    val dateFormatted = remember(stack.timestampMillis) {
-        val sdf = SimpleDateFormat("MMM d, yyyy · h:mm a", Locale.getDefault())
-        sdf.format(Date(stack.timestampMillis))
-    }
-
-    val mediaItems = stack.items
-    val pagerState = rememberPagerState(initialPage = 0, pageCount = { maxOf(1, mediaItems.size) })
-
-    val faviconUrl = remember(stack.sourceDomain) {
-        if (stack.sourceDomain.isNotBlank()) {
-            "https://www.google.com/s2/favicons?domain=${stack.sourceDomain}&sz=128"
-        } else ""
-    }
-
-    // Derive tags without fabricating any information
-    val derivedTags = remember(stack) {
-        val tags = mutableListOf<String>()
-        if (stack.sourceDomain.isNotBlank()) {
-            tags.add(stack.sourceDomain.removePrefix("www."))
-        }
-        if (stack.items.isNotEmpty()) {
-            tags.add("${stack.items.size} Media")
-        } else if (stack.sourceUrl.isNotBlank()) {
-            tags.add("Web Link")
-        }
-        if (tags.isEmpty()) {
-            tags.add("Bookmark")
-        }
-        tags
-    }
-
-    Surface(
-        modifier = modifier
-            .fillMaxSize()
-            .background(PocketThemeColors.background(isDark)),
-        color = PocketThemeColors.background(isDark)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-        ) {
-            // Top App Bar with Circular Buttons matching image_a086dfff.png
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                // Back Button (Circle)
-                Surface(
-                    shape = CircleShape,
-                    color = barSurface,
-                    shadowElevation = if (isDark) 2.dp else 1.dp,
-                    border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.7f) else dividerCol),
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clickable(onClick = onBack)
-                        .testTag("bookmark_viewer_back_button")
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = textColor,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                }
-
-                // Action Buttons on Right (Reader, Copy, Delete)
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // 1. Open Reader / Browser
-                    if (stack.sourceUrl.isNotBlank()) {
-                        Surface(
-                            shape = CircleShape,
-                            color = barSurface,
-                            shadowElevation = if (isDark) 2.dp else 1.dp,
-                            border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.7f) else dividerCol),
-                            modifier = Modifier
-                                .size(44.dp)
-                                .clickable { onOpenBrowser(stack.sourceUrl) }
-                                .testTag("bookmark_viewer_reader_button")
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    imageVector = Icons.Default.MenuBook,
-                                    contentDescription = "Open in Reader",
-                                    tint = textColor,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                        }
-                    }
-
-                    // 2. Copy Link
-                    Surface(
-                        shape = CircleShape,
-                        color = barSurface,
-                        shadowElevation = if (isDark) 2.dp else 1.dp,
-                        border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.7f) else dividerCol),
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clickable {
-                                val textToCopy = stack.sourceUrl.ifBlank { stack.title }
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                val clip = ClipData.newPlainText("URL", textToCopy)
-                                clipboard.setPrimaryClip(clip)
-                                Toast.makeText(context, "Link copied to clipboard", Toast.LENGTH_SHORT).show()
-                            }
-                            .testTag("bookmark_viewer_copy_button")
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.Default.ContentCopy,
-                                contentDescription = "Copy link",
-                                tint = textColor,
-                                modifier = Modifier.size(19.dp)
-                            )
-                        }
-                    }
-
-                    // 3. Delete (monochrome)
-                    Surface(
-                        shape = CircleShape,
-                        color = barSurface,
-                        shadowElevation = if (isDark) 2.dp else 1.dp,
-                        border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.7f) else dividerCol),
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clickable(onClick = onDelete)
-                            .testTag("bookmark_viewer_delete_button")
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.Default.DeleteOutline,
-                                contentDescription = "Delete bookmark",
-                                tint = textColor,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Upper Visual Area: Card Deck & Pagination
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp, bottom = 8.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                // Layered Card Deck matching image_a086dfff.png
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 24.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    // Layer 1 (Bottom stacked layer)
-                    Surface(
-                        shape = RoundedCornerShape(26.dp),
-                        color = PocketThemeColors.stackLayer1(isDark),
-                        modifier = Modifier
-                            .fillMaxWidth(0.86f)
-                            .height(180.dp)
-                            .offset(y = (-10).dp)
-                    ) {}
-
-                    // Layer 2 (Middle stacked layer)
-                    Surface(
-                        shape = RoundedCornerShape(26.dp),
-                        color = PocketThemeColors.stackLayer2(isDark),
-                        modifier = Modifier
-                            .fillMaxWidth(0.93f)
-                            .height(185.dp)
-                            .offset(y = (-5).dp)
-                    ) {}
-
-                    // Layer 3 (Top Front Card)
-                    Surface(
-                        shape = RoundedCornerShape(26.dp),
-                        color = PocketThemeColors.stackFront(isDark),
-                        shadowElevation = if (isDark) 8.dp else 4.dp,
-                        border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.7f) else dividerCol),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(195.dp)
-                    ) {
-                        if (mediaItems.isNotEmpty()) {
-                            HorizontalPager(
-                                state = pagerState,
-                                modifier = Modifier.fillMaxSize()
-                            ) { page ->
-                                val item = mediaItems[page]
-                                val mediaPath = remember(item) {
-                                    if (item.localUri.isNotBlank()) {
-                                        val f = File(item.localUri.removePrefix("file://"))
-                                        if (f.exists()) f else item.sourceUrl
-                                    } else item.sourceUrl
-                                }
-
-                                Box(
-                                    modifier = Modifier.fillMaxSize(),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    AsyncImage(
-                                        model = ImageRequest.Builder(context)
-                                            .data(mediaPath)
-                                            .crossfade(true)
-                                            .build(),
-                                        contentDescription = item.title,
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                }
-                            }
-                        } else {
-                            // Web link preview presentation with icon & artwork
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .background(
-                                        Brush.linearGradient(
-                                            colors = PocketThemeColors.webGradient(isDark)
-                                        )
-                                    ),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Column(
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.Center
-                                ) {
-                                    if (faviconUrl.isNotBlank()) {
-                                        Surface(
-                                            shape = RoundedCornerShape(16.dp),
-                                            color = PocketThemeColors.faviconSurface(isDark),
-                                            shadowElevation = 3.dp,
-                                            modifier = Modifier.size(52.dp)
-                                        ) {
-                                            Box(contentAlignment = Alignment.Center) {
-                                                AsyncImage(
-                                                    model = ImageRequest.Builder(context)
-                                                        .data(faviconUrl)
-                                                        .crossfade(true)
-                                                        .build(),
-                                                    contentDescription = stack.sourceDomain,
-                                                    modifier = Modifier.size(34.dp)
-                                                )
-                                            }
-                                        }
-                                    } else {
-                                        Icon(
-                                            imageVector = Icons.Default.Bookmark,
-                                            contentDescription = null,
-                                            tint = textColor,
-                                            modifier = Modifier.size(44.dp)
-                                        )
-                                    }
-                                    Spacer(Modifier.height(8.dp))
-                                    Text(
-                                        text = stack.sourceDomain.ifBlank { "Bookmark Preview" },
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = textColor
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(10.dp))
-
-                // Pagination pill indicator [🖼️ 1 / 1] matching image_a086dfff.png
-                Surface(
-                    shape = CircleShape,
-                    color = barSurface,
-                    border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.7f) else dividerCol),
-                    modifier = Modifier.height(30.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Image,
-                            contentDescription = null,
-                            tint = secondaryText,
-                            modifier = Modifier.size(15.dp)
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        val currentPage = if (mediaItems.isNotEmpty()) pagerState.currentPage + 1 else 1
-                        val totalPages = maxOf(1, mediaItems.size)
-                        Text(
-                            text = "$currentPage / $totalPages",
-                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                            color = textColor
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(4.dp))
-
-            // Bottom Drawer / Bottom Sheet: anchored to and starts from bottom, filling remaining height!
-            Surface(
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                color = PocketThemeColors.drawerSurface(isDark),
-                tonalElevation = 6.dp,
-                shadowElevation = 12.dp,
-                border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.7f) else dividerCol),
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .verticalScroll(rememberScrollState())
-                        .navigationBarsPadding()
-                        .padding(horizontal = 20.dp, vertical = 14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    // Drag Handle Pill (with swipe down to dismiss drawer gesture)
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.CenterHorizontally)
-                            .padding(vertical = 2.dp)
-                            .size(width = 80.dp, height = 20.dp)
-                            .pointerInput(Unit) {
-                                detectVerticalDragGestures { _, dragAmount ->
-                                    if (dragAmount > 15f) {
-                                        onBack()
-                                    }
-                                }
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .width(44.dp)
-                                .height(4.dp)
-                                .clip(CircleShape)
-                                .background(PocketThemeColors.drawerHandle(isDark))
-                        )
-                    }
-
-                    Spacer(Modifier.height(4.dp))
-
-                    // 1. Time Row
-                    PocketDetailCardRow(
-                        icon = Icons.Default.CalendarToday,
-                        label = "Time",
-                        value = dateFormatted,
-                        textColor = textColor,
-                        secondaryText = secondaryText,
-                        barSurface = barSurface,
-                        dividerCol = dividerCol
-                    )
-
-                    // 2. Source Row (Clickable to open link)
-                    PocketDetailCardRow(
-                        icon = Icons.Default.Link,
-                        label = "Source",
-                        value = stack.sourceUrl.ifBlank { stack.sourceDomain.ifBlank { "No source URL" } },
-                        trailingIcon = if (stack.sourceUrl.isNotBlank()) Icons.AutoMirrored.Filled.OpenInNew else null,
-                        onClick = if (stack.sourceUrl.isNotBlank()) { { onOpenBrowser(stack.sourceUrl) } } else null,
-                        textColor = textColor,
-                        secondaryText = secondaryText,
-                        barSurface = barSurface,
-                        dividerCol = dividerCol
-                    )
-
-                    // 3. Note Row (Clickable to edit note)
-                    PocketDetailCardRow(
-                        icon = Icons.Default.Description,
-                        label = "Note",
-                        value = stack.description.ifBlank { "Tap to add note" },
-                        trailingIcon = Icons.Default.Edit,
-                        onClick = onEditNote,
-                        textColor = textColor,
-                        secondaryText = secondaryText,
-                        barSurface = barSurface,
-                        dividerCol = dividerCol
-                    )
-
-                    // 4. Tags Row
-                    Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        color = barSurface,
-                        border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.5f) else Color(0xFFE6E6E6)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 14.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Sell,
-                                contentDescription = null,
-                                tint = textColor,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(Modifier.width(12.dp))
-                            Text(
-                                text = "Tags",
-                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                                color = textColor
-                            )
-                            Spacer(Modifier.width(16.dp))
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                derivedTags.forEach { tag ->
-                                    Surface(
-                                        shape = CircleShape,
-                                        color = PocketThemeColors.tagChipBg(isDark),
-                                        border = BorderStroke(0.5.dp, if (isDark) dividerCol else Color(0xFFDDDDDD)),
-                                        modifier = Modifier.height(28.dp)
-                                    ) {
-                                        Box(
-                                            contentAlignment = Alignment.Center,
-                                            modifier = Modifier.padding(horizontal = 10.dp)
-                                        ) {
-                                            Text(
-                                                text = tag,
-                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
-                                                color = textColor
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 5. Title Row
-                    PocketDetailCardRow(
-                        icon = Icons.Default.ShortText,
-                        label = "Title",
-                        value = stack.title.ifBlank { "Untitled Bookmark" },
-                        textColor = textColor,
-                        secondaryText = secondaryText,
-                        barSurface = barSurface,
-                        dividerCol = dividerCol
-                    )
-
-                    // 6. Description Row
-                    Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        color = barSurface,
-                        border = BorderStroke(1.dp, if (isDark) dividerCol.copy(alpha = 0.5f) else Color(0xFFE6E6E6)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 14.dp, vertical = 12.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.Default.Subject,
-                                    contentDescription = null,
-                                    tint = textColor,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(Modifier.width(12.dp))
-                                Text(
-                                    text = "Description",
-                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                                    color = textColor
-                                )
-                            }
-                            Spacer(Modifier.height(8.dp))
-                            Text(
-                                text = if (stack.description.isNotBlank()) stack.description else "No additional description provided.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = if (stack.description.isNotBlank()) textColor else secondaryText
-                            )
-                        }
-                    }
-
-                    Spacer(Modifier.height(20.dp))
-                }
-            }
-        }
-    }
-}
-
-/**
  * Reusable detail row card conforming to image_a086dfff.png
  */
 @Composable
@@ -1810,10 +1371,11 @@ fun PocketEmptyState(
 @Composable
 fun AddBookmarkDialog(
     onDismiss: () -> Unit,
-    onSave: (title: String, url: String, description: String) -> Unit,
+    onSave: (title: String, url: String, description: String, previewImageUrl: String) -> Unit,
     isDark: Boolean = MaterialTheme.colorScheme.surface.luminance() < 0.5f
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val textColor = PocketThemeColors.primaryText(isDark)
     val secondaryText = PocketThemeColors.secondaryText(isDark)
     val dialogSurface = if (isDark) Color(0xFF1E1E1E) else Color(0xFFFFFFFF)
@@ -1822,6 +1384,47 @@ fun AddBookmarkDialog(
     var urlText by remember { mutableStateOf("") }
     var titleText by remember { mutableStateOf("") }
     var descText by remember { mutableStateOf("") }
+    var previewImageUrl by remember { mutableStateOf("") }
+    var isFetchingMetadata by remember { mutableStateOf(false) }
+
+    fun triggerAutoFetch(urlToFetch: String) {
+        val trimmed = urlToFetch.trim()
+        if (trimmed.length < 4) return
+        val isValid = MediaClassifier.isValidWebUrl(trimmed) ||
+                trimmed.startsWith("http://", ignoreCase = true) ||
+                trimmed.startsWith("https://", ignoreCase = true)
+        if (!isValid) return
+
+        scope.launch {
+            isFetchingMetadata = true
+            try {
+                val meta = LinkMetadataFetcher.fetch(trimmed)
+                if (urlText.trim() == trimmed) {
+                    val domain = MediaClassifier.cleanDomainFromUrl(trimmed)
+                    if (titleText.isBlank() || titleText.equals(domain, ignoreCase = true)) {
+                        if (meta.title.isNotBlank()) titleText = meta.title
+                    }
+                    if (descText.isBlank() && meta.description.isNotBlank()) {
+                        descText = meta.description
+                    }
+                    if (meta.previewImageUrl.isNotBlank()) {
+                        previewImageUrl = meta.previewImageUrl
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                isFetchingMetadata = false
+            }
+        }
+    }
+
+    LaunchedEffect(urlText) {
+        val trimmed = urlText.trim()
+        if (trimmed.length > 7 && (MediaClassifier.isValidWebUrl(trimmed) || trimmed.startsWith("http://") || trimmed.startsWith("https://"))) {
+            kotlinx.coroutines.delay(500)
+            triggerAutoFetch(trimmed)
+        }
+    }
 
     val clipboard = remember {
         context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -1858,6 +1461,7 @@ fun AddBookmarkDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(20.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1891,6 +1495,7 @@ fun AddBookmarkDialog(
                                 if (titleText.isBlank()) {
                                     titleText = MediaClassifier.cleanDomainFromUrl(clipboardUrl)
                                 }
+                                triggerAutoFetch(clipboardUrl)
                             }
                     ) {
                         Row(
@@ -1929,16 +1534,88 @@ fun AddBookmarkDialog(
                     placeholder = { Text("https://example.com") },
                     singleLine = true,
                     colors = textFieldColors,
+                    trailingIcon = {
+                        if (isFetchingMetadata) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = textColor
+                            )
+                        } else if (urlText.isNotBlank()) {
+                            IconButton(onClick = { triggerAutoFetch(urlText) }) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Fetch link preview",
+                                    tint = secondaryText,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+                    },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                // Fetching progress status
+                if (isFetchingMetadata) {
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    ) {
+                        Text(
+                            text = "Fetching link title, description & preview...",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
+                            color = secondaryText
+                        )
+                    }
+                }
+
+                // Live Preview Card
+                if (previewImageUrl.isNotBlank()) {
+                    Spacer(Modifier.height(10.dp))
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PocketThemeColors.thumbnailBg(isDark),
+                        border = BorderStroke(0.5.dp, borderCol),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(110.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(context)
+                                    .data(previewImageUrl)
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = "Link Preview",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = PocketThemeColors.badgeBg(isDark),
+                                modifier = Modifier
+                                    .align(Alignment.BottomStart)
+                                    .padding(6.dp)
+                            ) {
+                                Text(
+                                    text = "Preview Image",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = PocketThemeColors.badgeText(isDark),
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                }
 
                 Spacer(Modifier.height(10.dp))
 
                 OutlinedTextField(
                     value = titleText,
                     onValueChange = { titleText = it },
-                    label = { Text("Title (optional)") },
+                    label = { Text("Title (auto-fetched or custom)") },
                     placeholder = { Text("Article or page title") },
                     singleLine = true,
                     colors = textFieldColors,
@@ -1951,7 +1628,7 @@ fun AddBookmarkDialog(
                 OutlinedTextField(
                     value = descText,
                     onValueChange = { descText = it },
-                    label = { Text("Notes / Description (optional)") },
+                    label = { Text("Notes / Description (auto-fetched or custom)") },
                     placeholder = { Text("Add notes or details") },
                     maxLines = 3,
                     colors = textFieldColors,
@@ -1974,7 +1651,7 @@ fun AddBookmarkDialog(
                     Button(
                         onClick = {
                             if (urlText.isNotBlank()) {
-                                onSave(titleText, urlText, descText)
+                                onSave(titleText, urlText, descText, previewImageUrl)
                             }
                         },
                         enabled = urlText.isNotBlank(),
@@ -2000,9 +1677,11 @@ fun AddBookmarkDialog(
 fun EditBookmarkDialog(
     stack: MediaInboxStack,
     onDismiss: () -> Unit,
-    onSave: (title: String, description: String) -> Unit,
+    onSave: (title: String, description: String, previewImageUrl: String) -> Unit,
     isDark: Boolean = MaterialTheme.colorScheme.surface.luminance() < 0.5f
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val textColor = PocketThemeColors.primaryText(isDark)
     val secondaryText = PocketThemeColors.secondaryText(isDark)
     val dialogSurface = if (isDark) Color(0xFF1E1E1E) else Color(0xFFFFFFFF)
@@ -2010,6 +1689,8 @@ fun EditBookmarkDialog(
 
     var titleText by remember { mutableStateOf(stack.title) }
     var descText by remember { mutableStateOf(stack.description) }
+    var previewImageUrl by remember { mutableStateOf(stack.previewImageUrl) }
+    var isFetching by remember { mutableStateOf(false) }
 
     val textFieldColors = OutlinedTextFieldDefaults.colors(
         focusedBorderColor = textColor,
@@ -2035,14 +1716,71 @@ fun EditBookmarkDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(20.dp)
             ) {
-                Text(
-                    text = "Edit Bookmark",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = textColor
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Edit Bookmark",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = textColor
+                    )
+
+                    if (stack.sourceUrl.isNotBlank()) {
+                        TextButton(
+                            onClick = {
+                                scope.launch {
+                                    isFetching = true
+                                    try {
+                                        val meta = LinkMetadataFetcher.fetch(stack.sourceUrl)
+                                        if (meta.title.isNotBlank()) titleText = meta.title
+                                        if (meta.description.isNotBlank()) descText = meta.description
+                                        if (meta.previewImageUrl.isNotBlank()) previewImageUrl = meta.previewImageUrl
+                                    } catch (_: Exception) {
+                                    } finally {
+                                        isFetching = false
+                                    }
+                                }
+                            },
+                            enabled = !isFetching
+                        ) {
+                            if (isFetching) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 1.5.dp, color = textColor)
+                            } else {
+                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp), tint = textColor)
+                                Spacer(Modifier.width(4.dp))
+                                Text("Re-fetch", style = MaterialTheme.typography.labelSmall, color = textColor)
+                            }
+                        }
+                    }
+                }
+
+                if (previewImageUrl.isNotBlank()) {
+                    Spacer(Modifier.height(10.dp))
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PocketThemeColors.thumbnailBg(isDark),
+                        border = BorderStroke(0.5.dp, borderCol),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(100.dp)
+                    ) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(previewImageUrl)
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = "Preview Image",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                }
 
                 Spacer(Modifier.height(16.dp))
 
@@ -2080,7 +1818,7 @@ fun EditBookmarkDialog(
                     }
                     Spacer(Modifier.width(8.dp))
                     Button(
-                        onClick = { onSave(titleText, descText) },
+                        onClick = { onSave(titleText, descText, previewImageUrl) },
                         enabled = titleText.isNotBlank(),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (isDark) Color(0xFFEEEEEE) else Color(0xFF202020),
@@ -2105,8 +1843,24 @@ fun EditBookmarkDialog(
 fun PocketFilterBottomSheet(
     currentSort: String,
     currentFilter: String,
+    showSvg: Boolean,
+    showVideos: Boolean,
+    showStreams: Boolean,
+    showPng: Boolean,
+    showGif: Boolean,
+    minWidth: Int,
+    minHeight: Int,
+    minSizeKb: Int,
     onSelectSort: (String) -> Unit,
     onSelectFilter: (String) -> Unit,
+    onToggleShowSvg: (Boolean) -> Unit,
+    onToggleShowVideos: (Boolean) -> Unit,
+    onToggleShowStreams: (Boolean) -> Unit,
+    onToggleShowPng: (Boolean) -> Unit,
+    onToggleShowGif: (Boolean) -> Unit,
+    onWidthChange: (Int) -> Unit,
+    onHeightChange: (Int) -> Unit,
+    onSizeChange: (Int) -> Unit,
     onDismiss: () -> Unit,
     isDark: Boolean = MaterialTheme.colorScheme.surface.luminance() < 0.5f
 ) {
@@ -2167,7 +1921,7 @@ fun PocketFilterBottomSheet(
                 }
             }
 
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(18.dp))
 
             Text(
                 text = "Show",
@@ -2180,7 +1934,8 @@ fun PocketFilterBottomSheet(
             val filterOptions = listOf("All", "Web Links", "Notes")
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 filterOptions.forEach { filter ->
                     val selected = currentFilter == filter
@@ -2202,7 +1957,306 @@ fun PocketFilterBottomSheet(
                 }
             }
 
+            Spacer(Modifier.height(18.dp))
+
+            // Media Type Pills in the same row as SVG for Videos, Streams and PNGs, GIFs (Icon only, no text)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // SVG Pill Switch (Disabled by default, icon only)
+                PocketMediaFilterPill(
+                    icon = Icons.Default.Polyline,
+                    contentDesc = "SVG",
+                    checked = showSvg,
+                    onCheckedChange = onToggleShowSvg,
+                    isDark = isDark,
+                    testTag = "filter_svg_pill_switch"
+                )
+
+                // Videos Pill Switch (Icon only)
+                PocketMediaFilterPill(
+                    icon = Icons.Default.Videocam,
+                    contentDesc = "Videos",
+                    checked = showVideos,
+                    onCheckedChange = onToggleShowVideos,
+                    isDark = isDark,
+                    testTag = "filter_videos_pill_switch"
+                )
+
+                // Streams Pill Switch (Icon only)
+                PocketMediaFilterPill(
+                    icon = Icons.Default.Sensors,
+                    contentDesc = "Streams",
+                    checked = showStreams,
+                    onCheckedChange = onToggleShowStreams,
+                    isDark = isDark,
+                    testTag = "filter_streams_pill_switch"
+                )
+
+                // PNGs Pill Switch (Icon only)
+                PocketMediaFilterPill(
+                    icon = Icons.Default.Image,
+                    contentDesc = "PNG",
+                    checked = showPng,
+                    onCheckedChange = onToggleShowPng,
+                    isDark = isDark,
+                    testTag = "filter_png_pill_switch"
+                )
+
+                // GIFs Pill Switch (Icon only)
+                PocketMediaFilterPill(
+                    icon = Icons.Default.Gif,
+                    contentDesc = "GIF",
+                    checked = showGif,
+                    onCheckedChange = onToggleShowGif,
+                    isDark = isDark,
+                    testTag = "filter_gif_pill_switch"
+                )
+            }
+
+            Spacer(Modifier.height(20.dp))
+
+            // Minimum Horizontal Dimension in its own separate row with 0 to infinity and current value displayed
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("filter_min_width_section")
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SwapHoriz,
+                            contentDescription = "Minimum Horizontal Dimension",
+                            tint = if (minWidth > 0) textColor else secondaryText,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            text = "Minimum Width",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = secondaryText
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (minWidth > 0) (if (isDark) Color(0xFF2A2A2A) else Color(0xFFE8E8E8)) else Color.Transparent
+                    ) {
+                        val textDisplay = when {
+                            minWidth <= 0 -> "0 px (Any)"
+                            minWidth >= 4000 -> "4000+ px (∞)"
+                            else -> "$minWidth px"
+                        }
+                        Text(
+                            text = textDisplay,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = if (minWidth > 0) textColor else secondaryText,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Slider(
+                    value = minWidth.toFloat().coerceIn(0f, 4000f),
+                    onValueChange = { onWidthChange(it.roundToInt()) },
+                    valueRange = 0f..4000f,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("filter_min_width_slider"),
+                    colors = SliderDefaults.colors(
+                        thumbColor = if (minWidth > 0) textColor else secondaryText,
+                        activeTrackColor = textColor,
+                        inactiveTrackColor = if (isDark) Color(0xFF383838) else Color(0xFFE0E0E0)
+                    )
+                )
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // Minimum Vertical Dimension in its own separate row with 0 to infinity and current value displayed
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("filter_min_height_section")
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SwapVert,
+                            contentDescription = "Minimum Vertical Dimension",
+                            tint = if (minHeight > 0) textColor else secondaryText,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            text = "Minimum Height",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = secondaryText
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (minHeight > 0) (if (isDark) Color(0xFF2A2A2A) else Color(0xFFE8E8E8)) else Color.Transparent
+                    ) {
+                        val textDisplay = when {
+                            minHeight <= 0 -> "0 px (Any)"
+                            minHeight >= 4000 -> "4000+ px (∞)"
+                            else -> "$minHeight px"
+                        }
+                        Text(
+                            text = textDisplay,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = if (minHeight > 0) textColor else secondaryText,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Slider(
+                    value = minHeight.toFloat().coerceIn(0f, 4000f),
+                    onValueChange = { onHeightChange(it.roundToInt()) },
+                    valueRange = 0f..4000f,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("filter_min_height_slider"),
+                    colors = SliderDefaults.colors(
+                        thumbColor = if (minHeight > 0) textColor else secondaryText,
+                        activeTrackColor = textColor,
+                        inactiveTrackColor = if (isDark) Color(0xFF383838) else Color(0xFFE0E0E0)
+                    )
+                )
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // Minimum Media Size Slider (0KB to 10MB) in separate row with current size position displayed
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("filter_min_size_section")
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FolderZip,
+                            contentDescription = "Minimum Media Size",
+                            tint = if (minSizeKb > 0) textColor else secondaryText,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            text = "Minimum Media Size",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = secondaryText
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (minSizeKb > 0) (if (isDark) Color(0xFF2A2A2A) else Color(0xFFE8E8E8)) else Color.Transparent
+                    ) {
+                        val sizeDisplay = when {
+                            minSizeKb <= 0 -> "0 KB (Any)"
+                            minSizeKb < 1024 -> "$minSizeKb KB"
+                            minSizeKb >= 10240 -> "10 MB"
+                            else -> "${String.format(Locale.US, "%.1f", minSizeKb / 1024f)} MB"
+                        }
+                        Text(
+                            text = sizeDisplay,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = if (minSizeKb > 0) textColor else secondaryText,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Slider(
+                    value = minSizeKb.toFloat().coerceIn(0f, 10240f),
+                    onValueChange = { onSizeChange(it.roundToInt()) },
+                    valueRange = 0f..10240f,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("filter_min_size_slider"),
+                    colors = SliderDefaults.colors(
+                        thumbColor = if (minSizeKb > 0) textColor else secondaryText,
+                        activeTrackColor = textColor,
+                        inactiveTrackColor = if (isDark) Color(0xFF383838) else Color(0xFFE0E0E0)
+                    )
+                )
+            }
+
             Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+/**
+ * Clean, icon-only pill switch for media type filtering matching the SVG pill design.
+ * No text or explanation, strictly icon + toggle switch.
+ */
+@Composable
+fun PocketMediaFilterPill(
+    icon: ImageVector,
+    contentDesc: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    isDark: Boolean,
+    testTag: String
+) {
+    Surface(
+        shape = CircleShape,
+        color = if (checked) (if (isDark) Color(0xFF2E2C34) else Color(0xFFE4DFEB))
+        else (if (isDark) Color(0xFF242424) else Color(0xFFF2F2F2)),
+        border = BorderStroke(
+            1.dp,
+            if (checked) (if (isDark) Color(0xFF555060) else Color(0xFFC5BED0))
+            else (if (isDark) Color(0xFF383838) else Color(0xFFE0E0E0))
+        ),
+        modifier = Modifier
+            .clip(CircleShape)
+            .clickable { onCheckedChange(!checked) }
+            .testTag(testTag)
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDesc,
+                tint = if (checked) (if (isDark) Color(0xFFEDEDED) else Color(0xFF161616))
+                else (if (isDark) Color(0xFF888888) else Color(0xFF757575)),
+                modifier = Modifier.size(20.dp)
+            )
+            Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                modifier = Modifier.scale(0.85f),
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = if (isDark) Color(0xFF161616) else Color(0xFFFFFFFF),
+                    checkedTrackColor = if (isDark) Color(0xFFEEEEEE) else Color(0xFF202020),
+                    uncheckedThumbColor = if (isDark) Color(0xFF888888) else Color(0xFF757575),
+                    uncheckedTrackColor = if (isDark) Color(0xFF323232) else Color(0xFFE0E0E0)
+                )
+            )
         }
     }
 }

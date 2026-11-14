@@ -17,6 +17,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import android.view.LayoutInflater
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,16 +34,67 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem as ExoMediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
+import com.amresalehin.emregallery.R
 import com.amresalehin.emregallery.data.OkHttpDownloader
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+
+/**
+ * Builds the Exo media item for a local path / file or content URI / remote URL.
+ * Only REMOTE URLs may get an HLS/DASH MIME override. The old code matched the substring "dash"
+ * anywhere, so a downloaded Reddit file named "DASH_720_xxx.mp4" was forced to be parsed as a DASH
+ * manifest and never played. Local paths are also converted with Uri.fromFile so names containing
+ * '#', '?' or '%' are not mangled by Uri.parse.
+ */
+internal fun buildPlayerMediaItem(uri: String): ExoMediaItem {
+    val isRemote = uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)
+    val hasScheme = isRemote || uri.startsWith("file://", ignoreCase = true) ||
+        uri.startsWith("content://", ignoreCase = true)
+    val parsed = if (hasScheme) Uri.parse(uri) else Uri.fromFile(java.io.File(uri))
+    val builder = ExoMediaItem.Builder().setUri(parsed)
+    if (isRemote) {
+        val path = parsed.path.orEmpty().lowercase()
+        when {
+            path.endsWith(".m3u8") || uri.contains("mpegurl", ignoreCase = true) -> builder.setMimeType(MimeTypes.APPLICATION_M3U8)
+            path.endsWith(".mpd") -> builder.setMimeType(MimeTypes.APPLICATION_MPD)
+        }
+    }
+    return builder.build()
+}
+
+internal fun isManifestUri(uri: String): Boolean {
+    val isRemote = uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)
+    if (!isRemote) return false
+    val path = Uri.parse(uri).path.orEmpty().lowercase()
+    return path.endsWith(".m3u8") || path.endsWith(".mpd")
+}
+
+/** Bounded error recovery: the old code called prepare() on every error, looping forever on bad media. */
+internal class PlaybackRecovery(private val maxRetries: Int = 2) {
+    private var attempts = 0
+    fun reset() { attempts = 0 }
+    fun onError(player: Player?, error: PlaybackException, tag: String) {
+        android.util.Log.w(tag, "Playback error: ${error.message} (${error.errorCodeName})")
+        val p = player ?: return
+        val cause = error.cause
+        if (cause is androidx.media3.exoplayer.video.MediaCodecVideoDecoderException || cause is IllegalStateException) {
+            p.clearVideoSurface()
+            return
+        }
+        if (attempts >= maxRetries) return
+        attempts++
+        p.prepare()
+    }
+}
 
 /**
  * State holder for video playback in the media viewer.
@@ -122,27 +174,18 @@ fun rememberViewerVideoState(
             val mediaSourceFactory = DefaultMediaSourceFactory(context)
                 .setDataSourceFactory(upstreamDataSourceFactory)
 
-            val parsedUri = Uri.parse(uri)
-            val isHls = uri.contains(".m3u8", ignoreCase = true) || uri.contains("mpegurl", ignoreCase = true)
-            val isDash = uri.contains(".mpd", ignoreCase = true) || uri.contains("dash", ignoreCase = true)
+            val isManifest = isManifestUri(uri)
+            val mediaItem = buildPlayerMediaItem(uri)
 
-            val mediaItem = ExoMediaItem.Builder()
-                .setUri(parsedUri)
-                .apply {
-                    if (isHls) {
-                        setMimeType(MimeTypes.APPLICATION_M3U8)
-                    } else if (isDash) {
-                        setMimeType(MimeTypes.APPLICATION_MPD)
-                    }
-                }
-                .build()
+            val renderersFactory = DefaultRenderersFactory(context)
+                .setEnableDecoderFallback(true)
 
-            ExoPlayer.Builder(context)
+            ExoPlayer.Builder(context, renderersFactory)
                 .setMediaSourceFactory(mediaSourceFactory)
                 .setLoadControl(loadControl)
                 .build().apply {
                     setMediaItem(mediaItem)
-                    repeatMode = if (isHls || isDash) Player.REPEAT_MODE_OFF else Player.REPEAT_MODE_ONE
+                    repeatMode = if (isManifest) Player.REPEAT_MODE_OFF else Player.REPEAT_MODE_ONE
                     videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT
                     prepare()
                     // Respect user's playback intent for this session:
@@ -164,8 +207,10 @@ fun rememberViewerVideoState(
 
     // Attach ExoPlayer listener to current active player
     DisposableEffect(player) {
+        val recovery = PlaybackRecovery()
         val listener = object : Player.Listener {
             override fun onRenderedFirstFrame() {
+                recovery.reset()
                 state.isFirstFrameRendered = true
             }
 
@@ -178,20 +223,31 @@ fun rememberViewerVideoState(
                     state.durationMs = player?.duration?.takeIf { it > 0L } ?: 0L
                 }
             }
+
+            override fun onPlayerError(error: PlaybackException) {
+                recovery.onError(player, error, "ViewerVideoPlayer")
+            }
         }
         player?.addListener(listener)
         onDispose {
             player?.removeListener(listener)
+            player?.clearVideoSurface()
             player?.stop()
             player?.release()
         }
     }
 
-    // Pause player when activity/lifecycle moves to background
+    // Release/pause player when activity/lifecycle moves to background
     DisposableEffect(lifecycleOwner, player) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_PAUSE) {
-                player?.pause()
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> player?.pause()
+                Lifecycle.Event.ON_STOP -> player?.pause()
+                Lifecycle.Event.ON_RESUME -> {
+                    if (player?.playbackState == Player.STATE_IDLE && player.playerError == null) player.prepare()
+                    if (sessionPlayIntent) player?.play()
+                }
+                else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -218,6 +274,7 @@ fun rememberViewerVideoState(
 
 /**
  * AndroidView host for ExoPlayer rendering within the HorizontalPager.
+ * Uses TextureView under the hood to ensure seamless Compose alpha animation and avoid SurfaceView release crashes.
  */
 @Composable
 fun VideoPlayerSurface(
@@ -227,7 +284,6 @@ fun VideoPlayerSurface(
     if (!videoState.isVideo || videoState.player == null) return
 
     // Keep the cached poster underneath and fade the first rendered video frame in over it.
-    // SurfaceView alpha is supported on API 26+, which is this app's minimum Android version.
     val surfaceAlpha by animateFloatAsState(
         targetValue = if (videoState.isFirstFrameRendered) 1f else 0f,
         animationSpec = tween(durationMillis = 180),
@@ -236,7 +292,9 @@ fun VideoPlayerSurface(
 
     AndroidView(
         factory = { ctx ->
-            PlayerView(ctx).apply {
+            val pv = LayoutInflater.from(ctx)
+                .inflate(R.layout.item_viewer_player, null, false) as PlayerView
+            pv.apply {
                 player = videoState.player
                 useController = false
                 setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
@@ -256,6 +314,12 @@ fun VideoPlayerSurface(
             pv.useController = false
             pv.setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
             pv.setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
+        },
+        onRelease = { pv ->
+            pv.player = null
+        },
+        onReset = { pv ->
+            pv.player = null
         }
     )
 }

@@ -120,6 +120,44 @@ fun AboutScreen(onBack: () -> Unit) {
                 }
             }
             item {
+                AboutInfoCard(
+                    title = "Architecture & comparisons",
+                    icon = Icons.Default.MenuBook
+                ) {
+                    Text(
+                        "Media Downloader vs. Snaptube",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Powered by embedded yt-dlp and gallery-dl via Chaquopy with native FFmpegKit remuxing. Provides 280+ supported imageboard/gallery categories, resilient multi-engine discovery, and 100% ad-free, private local downloading without background battery drain or third-party ad fraud.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "Pocket Bookmarking vs. Karakeep",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Unlike server-hosted Docker platforms, Pocket provides a true local-first visual media vault on Android. Features a 5:7 3D Card Deck with gesture swiping, hardware-accelerated Deep Scan with a 30% RAM governor to prevent Chromium OOMs, and granular dimension/size filters.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "Detailed documentation is available at docs/ARCHITECTURE_COMPARISON.md.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                    )
+                }
+            }
+            item {
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerLow,

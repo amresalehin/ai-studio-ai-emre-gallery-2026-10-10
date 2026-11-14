@@ -44,6 +44,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
@@ -156,6 +157,7 @@ fun PhotoMapTopBar(
 @Composable
 private fun SelectedPlaceBar(
     placeName: String?,
+    provenance: com.amresalehin.emregallery.data.LocationProvenance? = null,
     onOpen: () -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
@@ -255,20 +257,76 @@ private fun SelectedPlaceBar(
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(18.dp)
                 )
-                Text(
-                    text = placeName ?: PLACE_NAME_PLACEHOLDER,
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    fontStyle = if (placeName == null) FontStyle.Italic else FontStyle.Normal,
-                    color = if (placeName == null) {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    } else {
-                        MaterialTheme.colorScheme.onSurface
-                    },
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = placeName ?: PLACE_NAME_PLACEHOLDER,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        fontStyle = if (placeName == null) FontStyle.Italic else FontStyle.Normal,
+                        color = if (placeName == null) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (provenance != null) {
+                        Spacer(Modifier.height(3.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val methodLabel = when (provenance.matchMethod?.lowercase()) {
+                                "interpolated" -> "Interpolated location"
+                                "staypoint" -> "Staypoint visit"
+                                "nearest" -> "Nearest point"
+                                "existing_exif" -> "EXIF GPS"
+                                else -> provenance.matchMethod?.replaceFirstChar { it.uppercase() } ?: "Located"
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.85f)
+                            ) {
+                                Text(
+                                    text = methodLabel,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                )
+                            }
+                            if (provenance.sampleGapMinutes != null && provenance.sampleGapMinutes > 0.0) {
+                                Surface(
+                                    shape = RoundedCornerShape(4.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant
+                                ) {
+                                    Text(
+                                        text = "${String.format(Locale.US, "%.1f", provenance.sampleGapMinutes)}m gap",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                    )
+                                }
+                            }
+                            val sourceLabel = when {
+                                provenance.source?.contains("exif", ignoreCase = true) == true -> "EXIF"
+                                else -> provenance.source?.take(12) ?: "Source"
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+                            ) {
+                                Text(
+                                    text = sourceLabel,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                    }
+                }
                 Surface(
                     shape = CircleShape,
                     color = MaterialTheme.colorScheme.primaryContainer,
@@ -481,8 +539,12 @@ fun PhotoMapViewContainer(
             if (selectedMedia != null) {
                 // key() resets the bar's drag state whenever a different photo is selected.
                 key(selectedMedia.first.uri) {
+                    val provenance = remember(selectedMedia.first.uri) {
+                        com.amresalehin.emregallery.data.PhotoMapLocationCache(context).getLocation(selectedMedia.first.uri)?.provenance
+                    }
                     SelectedPlaceBar(
                         placeName = selectedPlaceName,
+                        provenance = provenance,
                         onOpen = onOpenSelected,
                         onDismiss = onDismissSelected,
                         modifier = Modifier.align(Alignment.BottomCenter)

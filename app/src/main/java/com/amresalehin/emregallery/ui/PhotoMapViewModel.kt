@@ -81,7 +81,10 @@ class PhotoMapViewModel(application: Application) : AndroidViewModel(application
             val items = media
             val cached = withContext(Dispatchers.IO) { locationCache.loadAll() }
             val cachedLocated = items.mapNotNull { item ->
-                cached[item.uri]?.point?.let { item to it }
+                val loc = cached[item.uri]
+                if (loc?.point != null) {
+                    item to loc.point
+                } else null
             }
 
             val uncachedItems = if (forceRescan) items else items.filterNot { cached.containsKey(it.uri) }
@@ -118,14 +121,12 @@ class PhotoMapViewModel(application: Application) : AndroidViewModel(application
                 }
                 scanned++
 
-                // Avoid republishing the growing location list too frequently: each update
-                // invalidates the heatmap cache and recomposes the viewport grid.
                 if (scanned % 128 == 0 || scanned == uncachedItems.size) {
-                    val currentList = result.toList()
                     val currentScanned = scanned
+                    val snapshot = result.toList()
                     _uiState.update {
                         it.copy(
-                            locatedMedia = currentList,
+                            locatedMedia = snapshot,
                             scanProgress = currentScanned
                         )
                     }

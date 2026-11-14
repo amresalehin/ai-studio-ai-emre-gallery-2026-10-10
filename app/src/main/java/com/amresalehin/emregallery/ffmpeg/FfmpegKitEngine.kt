@@ -293,12 +293,45 @@ object FfmpegKitEngine {
         outputFile: File
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            // -y -i video -i audio -c:v copy -c:a aac -movflags +faststart output.mp4
-            val cmd = "-y -i \"${videoFile.absolutePath}\" -i \"${audioFile.absolutePath}\" -c:v copy -c:a aac -movflags +faststart \"${outputFile.absolutePath}\""
-            val result = executeCommand(cmd)
-            result.isSuccess && outputFile.exists() && outputFile.length() > 0L
+            if (!videoFile.isFile || videoFile.length() <= 0L ||
+                !audioFile.isFile || audioFile.length() <= 0L) return@withContext false
+
+            val videoInput = probeMedia(videoFile.absolutePath) ?: return@withContext false
+            val audioInput = probeMedia(audioFile.absolutePath) ?: return@withContext false
+            if (videoInput.videoCodec.isNullOrBlank() || audioInput.audioCodec.isNullOrBlank()) {
+                return@withContext false
+            }
+
+            // Keep video unchanged. Copy AAC; convert other audio codecs to AAC for MP4.
+            val audioCodec = if (audioInput.audioCodec.equals("AAC", ignoreCase = true)) "copy" else "aac"
+            outputFile.delete()
+            val cmd = "-y -i \"${videoFile.absolutePath}\" -i \"${audioFile.absolutePath}\" " +
+                "-map 0:v:0 -map 1:a:0 -sn -dn -c:v copy -c:a $audioCodec " +
+                "-movflags +faststart \"${outputFile.absolutePath}\""
+            var result = executeCommand(cmd)
+            if (!result.isSuccess || !outputFile.isFile || outputFile.length() <= 0L) {
+                outputFile.delete()
+                val fallbackCmd = "-y -i \"${videoFile.absolutePath}\" -i \"${audioFile.absolutePath}\" " +
+                    "-map 0:v:0 -map 1:a:0 -sn -dn -c:v libx264 -preset fast -crf 18 " +
+                    "-c:a aac -b:a 192k -movflags +faststart \"${outputFile.absolutePath}\""
+                result = executeCommand(fallbackCmd)
+            }
+            if (!result.isSuccess || !outputFile.isFile || outputFile.length() <= 0L) {
+                outputFile.delete()
+                return@withContext false
+            }
+
+            val outputInfo = probeMedia(outputFile.absolutePath)
+            val valid = outputInfo != null &&
+                !outputInfo.videoCodec.isNullOrBlank() &&
+                !outputInfo.audioCodec.isNullOrBlank() &&
+                outputInfo.durationSeconds > 0.0 &&
+                outputInfo.sizeBytes > 0L
+            if (!valid) outputFile.delete()
+            valid
         } catch (e: Throwable) {
             Log.e(TAG, "muxAudioAndVideo failed", e)
+            outputFile.delete()
             false
         }
     }
@@ -461,6 +494,81 @@ object FfmpegKitEngine {
         } catch (e: Exception) {
             Log.w(TAG, "resolveUriToFile failed: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Remuxes HLS/DASH/TS streams or URLs directly into a clean, standalone MP4 file.
+     */
+    suspend fun remuxStream(
+        streamUrl: String,
+        outputFile: File,
+        context: Context? = null,
+        headers: Map<String, String> = emptyMap()
+    ): FfmpegExecutionResult = withContext(Dispatchers.IO) {
+        fun quote(value: String): String =
+            "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+        val headerLines = headers.entries
+            .filter { it.key.isNotBlank() && it.value.isNotBlank() }
+            .joinToString("\\r\\n") { (key, value) ->
+                key.replace(":", "").replace("\\r", "").replace("\\n", "") +
+                    ": " + value.replace("\\r", "").replace("\\n", "").replace("\"", "")
+            }
+        val headerArg = if (headerLines.isBlank()) "" else "-headers \"${headerLines}\\r\\n\" "
+        val outputDirectory = outputFile.parentFile ?: outputFile.absoluteFile.parentFile
+        val stagingDirectory = File(outputDirectory, ".ffmpeg-staging")
+        if (!stagingDirectory.exists()) stagingDirectory.mkdirs()
+        val tempDirectory = stagingDirectory.takeIf { it.isDirectory } ?: outputDirectory
+        val tempFile = File(tempDirectory, ".${outputFile.nameWithoutExtension}-${System.nanoTime()}.part.mp4")
+        tempFile.delete()
+
+        val inputArg = headerArg + "-i ${quote(streamUrl)}"
+        val copyCmd = "-y $inputArg -map 0:v:0? -map 0:a:0? -sn -dn -c copy -movflags +faststart ${quote(tempFile.absolutePath)}"
+        var result = executeCommand(copyCmd)
+
+        suspend fun hasValidVideo(): Boolean {
+            if (!tempFile.isFile || tempFile.length() <= 0L) return false
+            val info = probeMedia(tempFile.absolutePath) ?: return false
+            return !info.videoCodec.isNullOrBlank() && info.durationSeconds > 0.0 && info.sizeBytes > 0L
+        }
+
+        if (!result.isSuccess || !hasValidVideo()) {
+            tempFile.delete()
+            val transcodeCmd = "-y $inputArg -map 0:v:0? -map 0:a:0? -sn -dn " +
+                "-c:v libx264 -preset fast -crf 20 -c:a aac -b:a 192k " +
+                "-movflags +faststart ${quote(tempFile.absolutePath)}"
+            result = executeCommand(transcodeCmd)
+        }
+
+        if (!result.isSuccess || !hasValidVideo()) {
+            tempFile.delete()
+            outputFile.delete()
+            result.copy(isSuccess = false, outputFile = null)
+        } else {
+            val publishTemp = File(outputDirectory, ".${outputFile.name}.${System.nanoTime()}.publishing")
+            outputFile.delete()
+            val published = if (tempFile.renameTo(outputFile)) {
+                true
+            } else {
+                runCatching {
+                    tempFile.copyTo(publishTemp, overwrite = true)
+                    publishTemp.isFile && publishTemp.length() == tempFile.length() && publishTemp.renameTo(outputFile)
+                }.getOrDefault(false).also {
+                    publishTemp.delete()
+                    if (it) tempFile.delete()
+                }
+            }
+            if (!published) {
+                tempFile.delete()
+                publishTemp.delete()
+                outputFile.delete()
+                return@withContext result.copy(isSuccess = false, outputFile = null)
+            }
+            context?.let { ctx ->
+                android.media.MediaScannerConnection.scanFile(ctx, arrayOf(outputFile.absolutePath), arrayOf("video/mp4"), null)
+            }
+            result.copy(outputFile = outputFile)
         }
     }
 }

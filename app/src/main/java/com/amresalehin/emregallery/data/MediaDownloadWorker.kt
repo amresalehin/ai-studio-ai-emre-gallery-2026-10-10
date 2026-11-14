@@ -11,8 +11,16 @@ import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicLong
+import android.media.MediaScannerConnection
+import android.net.Uri
 import org.json.JSONObject
 import java.io.File
 import kotlin.math.abs
@@ -106,10 +114,51 @@ class MediaDownloadWorker(
         val cookieString = OkHttpDownloader.sharedCookieJar.getCookieString(mediaUrl).takeIf { it.isNotBlank() }
             ?: downloadHeaders["Cookie"]
 
+        // Workers can be started in a fresh process with no UI: make sure the activity store is
+        // loaded BEFORE reporting progress/finish, otherwise those updates are silently dropped.
+        DownloadActivityManager.initialize(applicationContext)
+
         try {
             setForeground(getForegroundInfo())
         } catch (e: Exception) {
             Log.w(TAG, "Could not set silent foreground service notification: ${e.message}")
+        }
+
+        // Fast-path: Check if this media file is already saved in the Download storage folder
+        val alreadySaved = OkHttpDownloader.findExistingSavedFile(
+            context = applicationContext,
+            mediaUrl = mediaUrl,
+            fileName = fileName,
+            downloadId = itemId,
+            domain = sourceDomain
+        )
+        if (alreadySaved != null && alreadySaved.exists() && alreadySaved.length() > 0L) {
+            Log.d(TAG, "Media $title already saved at ${alreadySaved.absolutePath}, completing without download")
+            val fileUri = Uri.fromFile(alreadySaved).toString()
+            DownloadActivityManager.markFinished(
+                itemId = itemId,
+                localUri = fileUri,
+                sizeBytes = alreadySaved.length()
+            )
+            runCatching {
+                val pocketRepo = PocketRepository.getInstance(applicationContext)
+                val stack = pocketRepo.bookmarks.value.firstOrNull { it.id == stackId }
+                if (stack != null) {
+                    val updatedItems = stack.items.map { itm ->
+                        if (itm.id == itemId || itm.sourceUrl == mediaUrl) {
+                            itm.copy(localUri = fileUri, sizeBytes = alreadySaved.length())
+                        } else itm
+                    }
+                    pocketRepo.updateBookmark(stack.copy(items = updatedItems))
+                }
+            }
+            return@withContext Result.success(
+                workDataOf(
+                    KEY_LOCAL_URI to alreadySaved.absolutePath,
+                    KEY_SIZE_BYTES to alreadySaved.length(),
+                    KEY_ITEM_ID to itemId
+                )
+            )
         }
 
         setProgress(workDataOf(KEY_PROGRESS to 0.05f, KEY_STATUS to "Initializing download for $title..."))
@@ -117,6 +166,18 @@ class MediaDownloadWorker(
         try {
             var downloadedFile: File? = null
             var errorDiagnostic: String? = null
+            var lastStatusCode = -1
+            var lastRetryAfter: Long? = null
+            val lastProgressAt = AtomicLong(System.currentTimeMillis())
+            fun noteProgress() = lastProgressAt.set(System.currentTimeMillis())
+
+            fun recordHttpFailure(result: OkHttpDownloader.DownloadResult) {
+                if (errorDiagnostic == null && !result.errorMessage.isNullOrBlank()) {
+                    errorDiagnostic = result.errorMessage
+                }
+                if (result.statusCode > 0 && lastStatusCode <= 0) lastStatusCode = result.statusCode
+                if (result.retryAfterSeconds != null) lastRetryAfter = result.retryAfterSeconds
+            }
 
             setProgress(workDataOf(KEY_PROGRESS to 0.15f, KEY_STATUS to "Downloading $title..."))
             DownloadActivityManager.updateProgress(itemId, 0.15f, 0L, 0L, 0L)
@@ -131,7 +192,9 @@ class MediaDownloadWorker(
                 sourceEngine.contains("Network", ignoreCase = true) ||
                 sourceEngine.contains("Srcset", ignoreCase = true) ||
                 sourceEngine.contains("Direct", ignoreCase = true) ||
+                sourceEngine.contains("Pocket", ignoreCase = true) ||
                 mediaUrl.contains(".jpg", ignoreCase = true) ||
+                mediaUrl.contains(".jpeg", ignoreCase = true) ||
                 mediaUrl.contains(".png", ignoreCase = true) ||
                 mediaUrl.contains(".webp", ignoreCase = true) ||
                 mediaUrl.contains(".gif", ignoreCase = true) ||
@@ -149,6 +212,9 @@ class MediaDownloadWorker(
                 mediaUrl
             }
 
+            val effectiveDomain = sourceDomain.takeIf { it.isNotBlank() }
+                ?: OkHttpDownloader.extractDomain(sourceUrl.ifBlank { mediaUrl })
+
             // Strategy 1: Direct HTTP media via OkHttp (fast path, byte-level ranges, resumable)
             if (isDirectHttpAsset) {
                 setProgress(workDataOf(KEY_PROGRESS to 0.25f, KEY_STATUS to "Downloading via OkHttp: $title..."))
@@ -159,42 +225,63 @@ class MediaDownloadWorker(
                     referer = referer ?: sourceUrl,
                     downloadId = itemId,
                     headers = downloadHeaders,
-                    onProgress = { bytesRead, totalBytes ->
+                    domain = effectiveDomain,
+                    onProgressWithSpeed = { bytesRead, totalBytes, speedBps ->
+                        noteProgress()
                         val ratio = if (totalBytes > 0L) (bytesRead.toFloat() / totalBytes.toFloat()).coerceIn(0.1f, 0.95f) else 0.5f
-                        DownloadActivityManager.updateProgress(itemId, ratio, bytesRead, totalBytes, 0L)
+                        DownloadActivityManager.updateProgress(itemId, ratio, bytesRead, totalBytes, speedBps)
                     }
                 )
                 if (okResult.isSuccessful && okResult.file != null && okResult.file.exists() && okResult.file.length() > 0L) {
                     downloadedFile = okResult.file
+                } else {
+                    recordHttpFailure(okResult)
                 }
             }
 
-            // Strategy 2: Originating extractor (yt-dlp or gallery-dl) when required or as fallback
-            if ((downloadedFile == null || !downloadedFile.exists() || downloadedFile.length() == 0L) && GalleryDlEngine.isAvailable()) {
+            // Strategy 2: Originating extractor (yt-dlp or gallery-dl) when required or as fallback.
+            // The embedded Python engine cannot be interrupted, so it runs behind a stall watchdog:
+            // if it makes no progress for STALL_TIMEOUT_MS we stop waiting and move on instead of
+            // leaving the download "running" forever.
+            if (!isStopped && (downloadedFile == null || !downloadedFile.exists() || downloadedFile.length() == 0L) && GalleryDlEngine.isAvailable()) {
                 setProgress(workDataOf(KEY_PROGRESS to 0.35f, KEY_STATUS to "Downloading via extractor engine: $title..."))
-                downloadedFile = GalleryDlEngine.downloadMedia(
-                    context = applicationContext,
-                    mediaUrl = targetUrl,
-                    fileName = fileName,
-                    referer = referer ?: sourceUrl,
-                    headers = downloadHeaders,
-                    cookies = cookieString
-                )
-                // If targetUrl != mediaUrl and extractor returned null, retry with mediaUrl directly
-                if ((downloadedFile == null || !downloadedFile.exists() || downloadedFile.length() == 0L) && targetUrl != mediaUrl) {
-                    downloadedFile = GalleryDlEngine.downloadMedia(
+                noteProgress()
+                val extractorProgress: (Float, Long, Long, Long) -> Unit = { ratio, bytesRead, totalBytes, speedBps ->
+                    noteProgress()
+                    DownloadActivityManager.updateProgress(itemId, ratio, bytesRead, totalBytes, speedBps)
+                }
+                downloadedFile = withStallGuard(lastProgressAt, STALL_TIMEOUT_MS, MAX_EXTRACTOR_MS) {
+                    GalleryDlEngine.downloadMedia(
                         context = applicationContext,
-                        mediaUrl = mediaUrl,
+                        mediaUrl = targetUrl,
                         fileName = fileName,
                         referer = referer ?: sourceUrl,
                         headers = downloadHeaders,
-                        cookies = cookieString
+                        cookies = cookieString,
+                        domain = effectiveDomain,
+                        onProgress = extractorProgress
                     )
+                }
+                // If targetUrl != mediaUrl and extractor returned null, retry with mediaUrl directly
+                if (!isStopped && (downloadedFile == null || !downloadedFile.exists() || downloadedFile.length() == 0L) && targetUrl != mediaUrl) {
+                    noteProgress()
+                    downloadedFile = withStallGuard(lastProgressAt, STALL_TIMEOUT_MS, MAX_EXTRACTOR_MS) {
+                        GalleryDlEngine.downloadMedia(
+                            context = applicationContext,
+                            mediaUrl = mediaUrl,
+                            fileName = fileName,
+                            referer = referer ?: sourceUrl,
+                            headers = downloadHeaders,
+                            cookies = cookieString,
+                            domain = effectiveDomain,
+                            onProgress = extractorProgress
+                        )
+                    }
                 }
             }
 
             // Strategy 3: Final fallback to OkHttp for any URL that specialized extractors couldn't capture
-            if ((downloadedFile == null || !downloadedFile.exists() || downloadedFile.length() == 0L) && !isDirectHttpAsset) {
+            if (!isStopped && (downloadedFile == null || !downloadedFile.exists() || downloadedFile.length() == 0L) && !isDirectHttpAsset) {
                 setProgress(workDataOf(KEY_PROGRESS to 0.5f, KEY_STATUS to "Trying direct download fallback: $title..."))
                 val fallbackResult = OkHttpDownloader.downloadMediaFileDetailed(
                     context = applicationContext,
@@ -202,16 +289,25 @@ class MediaDownloadWorker(
                     fileName = fileName,
                     referer = referer ?: sourceUrl,
                     downloadId = itemId,
-                    headers = downloadHeaders
+                    headers = downloadHeaders,
+                    domain = effectiveDomain,
+                    onProgressWithSpeed = { bytesRead, totalBytes, speedBps ->
+                        noteProgress()
+                        val ratio = if (totalBytes > 0L) (bytesRead.toFloat() / totalBytes.toFloat()).coerceIn(0.1f, 0.95f) else 0.5f
+                        DownloadActivityManager.updateProgress(itemId, ratio, bytesRead, totalBytes, speedBps)
+                    }
                 )
                 if (fallbackResult.isSuccessful && fallbackResult.file != null && fallbackResult.file.exists() && fallbackResult.file.length() > 0L) {
                     downloadedFile = fallbackResult.file
-                } else if (errorDiagnostic == null) {
-                    errorDiagnostic = fallbackResult.errorMessage
+                } else {
+                    recordHttpFailure(fallbackResult)
                 }
             }
 
             if (isStopped) {
+                // Stopped by the user (pause/cancel: state already set by DownloadActivityManager) or by
+                // the system (constraints lost, process limits). In the system case WorkManager
+                // reschedules this work itself, so the activity must stay as-is and must NOT be failed.
                 Log.d(TAG, "MediaDownloadWorker was stopped for $mediaUrl")
                 return@withContext Result.failure()
             }
@@ -219,11 +315,47 @@ class MediaDownloadWorker(
             if (downloadedFile != null && downloadedFile.exists() && downloadedFile.length() > 0L) {
                 setProgress(workDataOf(KEY_PROGRESS to 1.0f, KEY_STATUS to "Saved successfully"))
 
+                val fileUri = Uri.fromFile(downloadedFile).toString()
+                runCatching {
+                    MediaScannerConnection.scanFile(
+                        applicationContext,
+                        arrayOf(downloadedFile.absolutePath),
+                        arrayOf(if (isVideo) "video/*" else if (isAudio) "audio/*" else "image/*"),
+                        null
+                    )
+                }
+
                 DownloadActivityManager.markFinished(
                     itemId = itemId,
-                    localUri = downloadedFile.absolutePath,
+                    localUri = fileUri,
                     sizeBytes = downloadedFile.length()
                 )
+
+                // Update EVERY bookmark that references this media, not just the one that enqueued it.
+                // Unique work is keyed by URL, so when two bookmarks share a file only one worker runs;
+                // the other bookmark would otherwise never learn its file exists and stay "saving" forever.
+                runCatching {
+                    val pocketRepo = PocketRepository.getInstance(applicationContext)
+                    val downloadedKey = MediaClassifier.deduplicationKey(mediaUrl)
+                    for (stack in pocketRepo.bookmarks.value) {
+                        var changed = false
+                        val updatedItems = stack.items.map { itm ->
+                            val itemMatches = itm.id == itemId || (itm.sourceUrl.isNotBlank() && (
+                                itm.sourceUrl == mediaUrl ||
+                                    MediaClassifier.deduplicationKey(itm.sourceUrl) == downloadedKey
+                                ))
+                            if (itemMatches && OkHttpDownloader.resolveLocalFile(itm.localUri) == null) {
+                                changed = true
+                                itm.copy(localUri = fileUri, sizeBytes = downloadedFile.length())
+                            } else itm
+                        }
+                        if (!changed) continue
+                        val updatedPreview = if (stack.previewImageUrl.isBlank() || (!isVideo && !isStream && stack.previewImageUrl == mediaUrl)) {
+                            fileUri
+                        } else stack.previewImageUrl
+                        pocketRepo.updateBookmark(stack.copy(items = updatedItems, previewImageUrl = updatedPreview))
+                    }
+                }
 
                 Result.success(
                     workDataOf(
@@ -233,29 +365,32 @@ class MediaDownloadWorker(
                     )
                 )
             } else {
-                val finalError = errorDiagnostic ?: "Download failed via yt-dlp and gallery-dl for $mediaUrl"
+                val finalError = errorDiagnostic
+                    ?: "Could not download $mediaUrl (the site returned no usable media)"
                 val currentItem = DownloadActivityManager.activities.value.firstOrNull { it.id == itemId }
-                val isPausedOrCancelled = isStopped ||
-                    currentItem?.status == DownloadActivityStatus.PAUSED ||
+                val isPausedOrCancelled = currentItem?.status == DownloadActivityStatus.PAUSED ||
                     currentItem?.errorMessage == "Cancelled by user"
 
                 if (!isPausedOrCancelled) {
                     DownloadActivityManager.handleDownloadFailure(
                         context = applicationContext,
                         itemId = itemId,
-                        statusCode = -1,
+                        statusCode = lastStatusCode,
                         errorMessage = finalError,
-                        retryAfterSeconds = null
+                        retryAfterSeconds = lastRetryAfter
                     )
                 }
                 Result.failure(workDataOf(KEY_ERROR to finalError))
             }
+        } catch (e: CancellationException) {
+            // Never swallow cancellation: let WorkManager see it so a system-stopped worker is
+            // rescheduled and a user-cancelled one is marked cancelled.
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error in MediaDownloadWorker for $mediaUrl", e)
-            val err = e.message ?: "Unknown error"
+            val err = e.message ?: e.javaClass.simpleName
             val currentItem = DownloadActivityManager.activities.value.firstOrNull { it.id == itemId }
             val isPausedOrCancelled = isStopped ||
-                e is kotlinx.coroutines.CancellationException ||
                 currentItem?.status == DownloadActivityStatus.PAUSED ||
                 currentItem?.errorMessage == "Cancelled by user"
 
@@ -274,7 +409,47 @@ class MediaDownloadWorker(
         }
     }
 
+    /**
+     * Runs a blocking, non-interruptible extractor call (embedded Python / FFmpeg) on a detached
+     * scope and waits for it with a stall watchdog. Returns null if the call made no progress for
+     * [stallMs], ran longer than [maxMs], or this worker was stopped. The orphaned call finishes on
+     * its own thread (yt-dlp has socket timeouts) but can no longer wedge this worker.
+     */
+    private suspend fun <T> withStallGuard(
+        lastProgressAt: AtomicLong,
+        stallMs: Long,
+        maxMs: Long,
+        block: suspend () -> T?
+    ): T? {
+        val deferred = detachedScope.async { block() }
+        val startedAt = System.currentTimeMillis()
+        try {
+            while (!deferred.isCompleted) {
+                delay(1_000L)
+                val now = System.currentTimeMillis()
+                if (isStopped) {
+                    return null
+                }
+                if (now - lastProgressAt.get() > stallMs) {
+                    Log.w(TAG, "Extractor stalled for ${stallMs / 1000}s with no progress; giving up on it")
+                    return null
+                }
+                if (now - startedAt > maxMs) {
+                    Log.w(TAG, "Extractor exceeded ${maxMs / 1000}s; giving up on it")
+                    return null
+                }
+            }
+            return runCatching { deferred.await() }.getOrNull()
+        } finally {
+            if (!deferred.isCompleted) deferred.cancel()
+        }
+    }
+
     companion object {
+        private val detachedScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        private const val STALL_TIMEOUT_MS = 180_000L
+        private const val MAX_EXTRACTOR_MS = 25 * 60_000L
+
         const val TAG = "MediaDownloadWorker"
         const val WORK_TAG_DOWNLOAD = "media_download"
 

@@ -109,6 +109,13 @@ object BrowserSession {
 
     private val tabRegistry = ConcurrentHashMap<String, BrowserTabSession>()
 
+    // Preserved navigation and scroll state for returning from discovered media view
+    var savedBrowserSite: String = ""
+    var savedScrollX: Int = 0
+    var savedScrollY: Int = 0
+    var pendingScrollRestore: Boolean = false
+    var activeWebView: WebView? = null
+
     fun getTabSession(tabId: String = "tab_main"): BrowserTabSession {
         return tabRegistry.getOrPut(tabId) { BrowserTabSession(tabId = tabId) }
     }
@@ -158,7 +165,8 @@ object BrowserSession {
         context: Context,
         targetUrl: String,
         onStatusUpdate: (String) -> Unit = {},
-        onMediaDiscovered: (ScrapedMediaItem) -> Unit = {}
+        onMediaDiscovered: (ScrapedMediaItem) -> Unit = {},
+        publishToDownloader: Boolean = true
     ): MediaExtractionResult = suspendCancellableCoroutine { continuation ->
         mainHandler.post {
             val normalizedUrl = if (!targetUrl.startsWith("http://", ignoreCase = true) && !targetUrl.startsWith("https://", ignoreCase = true)) {
@@ -168,16 +176,22 @@ object BrowserSession {
             val domain = runCatching { URL(normalizedUrl).host }.getOrDefault("")
             var webView: WebView? = null
             var isCompleted = false
+            var hydrationScanScheduled = false
 
             fun cleanup() {
                 try {
-                    mainHandler.removeCallbacksAndMessages(null)
-                    (webView?.parent as? ViewGroup)?.removeView(webView)
-                    webView?.stopLoading()
-                    webView?.removeJavascriptInterface("EmreBridge")
-                    webView?.webViewClient = WebViewClient()
-                    webView?.webChromeClient = WebChromeClient()
-                    webView?.destroy()
+                    val wv = webView ?: return
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                    wv.stopLoading()
+                    wv.loadUrl("about:blank")
+                    wv.clearHistory()
+                    wv.onPause()
+                    wv.removeJavascriptInterface("EmreBridge")
+                    wv.webViewClient = WebViewClient()
+                    wv.webChromeClient = WebChromeClient()
+                    wv.post {
+                        try { wv.destroy() } catch (_: Throwable) {}
+                    }
                 } catch (_: Throwable) {
                 } finally {
                     webView = null
@@ -197,6 +211,7 @@ object BrowserSession {
                 val viewWidth = if (displayMetrics.widthPixels > 0) displayMetrics.widthPixels else 1080
                 val viewHeight = if (displayMetrics.heightPixels > 0) displayMetrics.heightPixels else 1920
 
+                wv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
                 if (act != null && !act.isFinishing && !act.isDestroyed) {
                     val root = act.findViewById<ViewGroup>(android.R.id.content)
                     if (root != null) {
@@ -234,7 +249,9 @@ object BrowserSession {
                     if (modified) {
                         for (it in items) {
                             onMediaDiscovered(it)
-                            DownloaderSession.addDiscoveredItem(it)
+                            if (publishToDownloader) {
+                                DownloaderSession.addDiscoveredItem(it)
+                            }
                         }
                     }
                 }
@@ -287,42 +304,70 @@ object BrowserSession {
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        if (isCompleted) return
+                        if (isCompleted || hydrationScanScheduled) return
+                        hydrationScanScheduled = true
                         BotDetectionMitigator.injectStealth(view)
                         BotDetectionMitigator.syncCookiesFromWebView(url)
                         if (BotDetectionMitigator.isBotChallenge(view?.title, url)) {
                             onStatusUpdate("Bypassing anti-bot verification...")
                         } else {
-                            onStatusUpdate("Scanning dynamic page content...")
+                            onStatusUpdate("Waiting for dynamic page media...")
                         }
+
+                        // Keep observing mutations while client-side frameworks hydrate the page.
                         wv.evaluateJavascript(MediaCaptureEngine.getMutationObserverScript(), null)
-                        wv.evaluateJavascript(MediaCaptureEngine.getJsDomScanScript()) { scanJson ->
-                            val entries = MediaCaptureEngine.parseJsDomScanResult(scanJson, normalizedUrl)
-                            ingest(entries)
-                            if (seenMap.isNotEmpty()) {
-                                finish(null)
-                            } else {
-                                // Wait 2s for client-side JS / hydration
-                                mainHandler.postDelayed({
-                                    if (!isCompleted) {
-                                        wv.evaluateJavascript(MediaCaptureEngine.getJsDomScanScript()) { secondJson ->
-                                            val postEntries = MediaCaptureEngine.parseJsDomScanResult(secondJson, normalizedUrl)
-                                            ingest(postEntries)
-                                            finish(if (seenMap.isEmpty()) "No media discovered" else null)
+                        val scanScript = MediaCaptureEngine.getJsDomScanScript()
+                        wv.evaluateJavascript(scanScript) { initialJson ->
+                            ingest(MediaCaptureEngine.parseJsDomScanResult(initialJson, normalizedUrl))
+
+                            // Do not stop at the first image: it is often just a logo or a placeholder.
+                            mainHandler.postDelayed({
+                                if (!isCompleted) {
+                                    onStatusUpdate("Scanning hydrated page content...")
+                                    // Trigger lazy-loaded images and infinite-scroll media.
+                                    wv.evaluateJavascript(
+                                        "(function(){var h=Math.max(document.body?document.body.scrollHeight:0,document.documentElement?document.documentElement.scrollHeight:0);window.scrollTo(0,h);return true;})()",
+                                        null
+                                    )
+                                    mainHandler.postDelayed({
+                                        if (!isCompleted) {
+                                            wv.evaluateJavascript(scanScript) { postScrollJson ->
+                                                ingest(MediaCaptureEngine.parseJsDomScanResult(postScrollJson, normalizedUrl))
+                                                wv.evaluateJavascript("window.scrollTo(0,0);true;", null)
+
+                                                // One final pass catches media attached after the scroll-triggered load.
+                                                mainHandler.postDelayed({
+                                                    if (!isCompleted) {
+                                                        wv.evaluateJavascript(scanScript) { settledJson ->
+                                                            ingest(MediaCaptureEngine.parseJsDomScanResult(settledJson, normalizedUrl))
+                                                            finish(if (seenMap.isEmpty()) "No media discovered" else null)
+                                                        }
+                                                    }
+                                                }, 800L)
+                                            }
                                         }
-                                    }
-                                }, 2000L)
-                            }
+                                    }, 1800L)
+                                }
+                            }, 2400L)
                         }
+                    }
+
+                    override fun onRenderProcessGone(
+                        view: WebView?,
+                        detail: RenderProcessGoneDetail?
+                    ): Boolean {
+                        Log.w("BrowserSession", "Browser session renderer process gone. Cleaning up.")
+                        finish(if (seenMap.isEmpty()) "Renderer crashed" else null)
+                        return true
                     }
                 }
 
-                // 12-second watchdog timer
+                // Allow time for SPA hydration, lazy loading, and the final DOM scan.
                 mainHandler.postDelayed({
                     if (!isCompleted) {
                         finish(if (seenMap.isEmpty()) "Page scan timed out" else null)
                     }
-                }, 12000L)
+                }, 16000L)
 
                 wv.loadUrl(normalizedUrl)
             } catch (e: Exception) {
@@ -362,12 +407,17 @@ object BrowserSession {
 
             fun cleanup() {
                 try {
-                    mainHandler.removeCallbacksAndMessages(null)
-                    (webView?.parent as? ViewGroup)?.removeView(webView)
-                    webView?.stopLoading()
-                    webView?.webViewClient = WebViewClient()
-                    webView?.webChromeClient = WebChromeClient()
-                    webView?.destroy()
+                    val wv = webView ?: return
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                    wv.stopLoading()
+                    wv.loadUrl("about:blank")
+                    wv.clearHistory()
+                    wv.onPause()
+                    wv.webViewClient = WebViewClient()
+                    wv.webChromeClient = WebChromeClient()
+                    wv.post {
+                        try { wv.destroy() } catch (_: Throwable) {}
+                    }
                 } catch (_: Throwable) {
                 } finally {
                     webView = null
@@ -418,6 +468,7 @@ object BrowserSession {
                 val wv = if (act != null) WebView(act) else WebView(context)
                 webView = wv
 
+                wv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
                 if (act != null && !act.isFinishing && !act.isDestroyed) {
                     val root = act.findViewById<ViewGroup>(android.R.id.content)
                     if (root != null) {
@@ -475,6 +526,15 @@ object BrowserSession {
                                 }, 1200L)
                             }
                         }
+                    }
+
+                    override fun onRenderProcessGone(
+                        view: WebView?,
+                        detail: RenderProcessGoneDetail?
+                    ): Boolean {
+                        Log.w("BrowserSession", "Cookie session renderer process gone. Disposing.")
+                        finish(requiresSignIn = false, signInUrl = null)
+                        return true
                     }
                 }
 

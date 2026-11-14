@@ -10,9 +10,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -21,6 +28,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 enum class DownloadActivityStatus {
     DOWNLOADING,
@@ -75,17 +83,66 @@ object DownloadActivityManager {
 
     private var appContext: Context? = null
 
+    /** Guards every read-modify-write of [_activities]; workers, UI and retry jobs all mutate it. */
+    private val stateLock = Any()
+    private val initLock = Any()
+    @Volatile private var isLoaded = false
+    private var stuckWatchdogJob: Job? = null
+
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val activeRetryJobs = ConcurrentHashMap<String, Job>()
+    private var pocketBookmarksObserver: Job? = null
 
     fun initialize(context: Context) {
+        if (isLoaded) return
+        synchronized(initLock) {
         if (appContext == null) {
             appContext = context.applicationContext
             loadPersistedActivities()
+            // Only allow persisting after the stored history has been read; otherwise an early
+            // worker callback would overwrite the saved list with an empty one.
+            isLoaded = true
             // 1. Sanitize any stale false 4K labels from persisted items
             // 2. Ensure any items marked failed prematurely from temporary 429 errors resume as RETRYING under downloading filter
             val cleaned = _activities.value.map { item ->
                 var updated = item
+
+                // Check if the item's file already exists on disk
+                val hasLocalFile = item.localUri?.isNotBlank() == true && runCatching {
+                    val f = File(item.localUri.removePrefix("file://"))
+                    f.exists() && f.length() > 0L
+                }.getOrDefault(false)
+
+                val existingSaved = if (!hasLocalFile) {
+                    OkHttpDownloader.findExistingSavedFile(
+                        context = context,
+                        mediaUrl = item.mediaUrl,
+                        fileName = item.title,
+                        downloadId = item.id,
+                        domain = item.sourceDomain
+                    )
+                } else null
+
+                if (hasLocalFile && updated.status != DownloadActivityStatus.FINISHED) {
+                    val f = File(item.localUri!!.removePrefix("file://"))
+                    updated = updated.copy(
+                        status = DownloadActivityStatus.FINISHED,
+                        progress = 1.0f,
+                        bytesRead = f.length(),
+                        totalBytes = f.length(),
+                        speedBytesPerSec = 0L
+                    )
+                } else if (existingSaved != null && existingSaved.exists() && existingSaved.length() > 0L && updated.status != DownloadActivityStatus.FINISHED) {
+                    updated = updated.copy(
+                        status = DownloadActivityStatus.FINISHED,
+                        localUri = Uri.fromFile(existingSaved).toString(),
+                        progress = 1.0f,
+                        bytesRead = existingSaved.length(),
+                        totalBytes = existingSaved.length(),
+                        speedBytesPerSec = 0L
+                    )
+                }
+
                 if (!item.isVideo && item.format.contains("4K", ignoreCase = true)) {
                     val clean = if (item.mediaUrl.lowercase().contains(".png") || item.title.lowercase().endsWith(".png")) "PNG" else "JPG"
                     updated = updated.copy(format = clean)
@@ -108,7 +165,10 @@ object DownloadActivityManager {
             syncWithStorageDir(context)
             persistActivities()
             syncWithInboxRepository()
+            observePocketBookmarks(context.applicationContext)
             resumePersistedRetries(context.applicationContext)
+            startStuckDownloadWatchdog(context.applicationContext)
+        }
         }
     }
 
@@ -132,6 +192,7 @@ object DownloadActivityManager {
     }
 
     private fun persistActivities() {
+        if (!isLoaded) return
         val prefs = getPrefs() ?: return
         try {
             val jsonArray = JSONArray()
@@ -242,8 +303,49 @@ object DownloadActivityManager {
         }
     }
 
+    private fun observePocketBookmarks(context: Context) {
+        if (pocketBookmarksObserver?.isActive == true) return
+        pocketBookmarksObserver = scope.launch(Dispatchers.IO) {
+            PocketRepository.getInstance(context.applicationContext).bookmarks
+                .map { stacks ->
+                    stacks.map { stack ->
+                        stack.id to (
+                            stack.title to stack.items
+                                .filter { it.localUri.isNotBlank() }
+                                .map { item ->
+                                    listOf(
+                                        item.id,
+                                        item.localUri,
+                                        item.title,
+                                        item.sourceUrl,
+                                        item.sizeBytes.toString()
+                                    )
+                                }
+                        )
+                    }
+                }
+                .distinctUntilChanged()
+                .collect {
+                    syncWithInboxRepository()
+                }
+        }
+    }
+
+    private fun resolvePocketMediaSize(context: Context, localUri: String, fallbackSize: Long): Long? {
+        if (localUri.isBlank()) return null
+        val parsed = runCatching { Uri.parse(localUri) }.getOrNull()
+        if (parsed?.scheme.equals("content", ignoreCase = true)) {
+            val descriptorSize = runCatching {
+                context.contentResolver.openFileDescriptor(parsed!!, "r")?.use { it.statSize }
+            }.getOrNull() ?: return null
+            return descriptorSize.takeIf { it > 0L } ?: fallbackSize.takeIf { it > 0L }
+        }
+        val file = if (parsed?.scheme.equals("file", ignoreCase = true)) parsed?.path?.let(::File) else File(localUri)
+        return file?.takeIf { it.isFile && it.length() > 0L }?.length()
+    }
+
     /**
-     * Synchronizes and merges finished items from the real MediaInboxRepository.
+     * Synchronizes and merges finished items from the real MediaInboxRepository and PocketRepository.
      */
     fun syncWithInboxRepository() {
         val ctx = appContext ?: return
@@ -287,14 +389,72 @@ object DownloadActivityManager {
             }
         }
 
-        val currentActivities = _activities.value
-        val existingFinished = currentActivities.filter { it.status == DownloadActivityStatus.FINISHED }
-        val activeOrFailed = currentActivities.filter { it.status != DownloadActivityStatus.FINISHED }
-        val activeIds = activeOrFailed.map { it.id }.toSet()
-        val allFinished = (existingFinished + finishedItems).filter { it.id !in activeIds }.distinctBy { it.id }
+        // Also synchronize finished media saved from Pocket Bookmarks
+        try {
+            val pocketRepo = PocketRepository.getInstance(ctx)
+            val pocketBookmarks = pocketRepo.bookmarks.value
+            for (stack in pocketBookmarks) {
+                for (item in stack.items) {
+                    val cachedSize = resolvePocketMediaSize(ctx, item.localUri, item.sizeBytes)
+                    if (cachedSize != null) {
+                        val localName = Uri.parse(item.localUri).lastPathSegment?.takeIf { it.isNotBlank() } ?: "Media"
+                        val candidateId = item.id.ifBlank { "pocket_${stack.id}_${item.localUri.hashCode()}" }
+                        val uniqueId = if (seenIds.add(candidateId)) {
+                            candidateId
+                        } else {
+                            val fallback = "pocket_${stack.id}_${candidateId}_${item.localUri.hashCode()}"
+                            seenIds.add(fallback)
+                            fallback
+                        }
+                        finishedItems.add(
+                            DownloadActivityItem(
+                                id = uniqueId,
+                                title = item.title.ifBlank { stack.title.ifBlank { localName } },
+                                mediaUrl = item.sourceUrl.ifBlank { item.localUri },
+                                thumbnailUrl = item.localUri,
+                                localUri = item.localUri,
+                                isVideo = item.isVideo,
+                                isAudio = item.isAudio,
+                                isStream = item.isStream,
+                                format = item.format.ifBlank { if (item.isVideo) "MP4" else "JPG" },
+                                status = DownloadActivityStatus.FINISHED,
+                                progress = 1.0f,
+                                bytesRead = cachedSize,
+                                totalBytes = cachedSize,
+                                timestampMillis = stack.timestampMillis,
+                                durationHint = if (item.isVideo) "HD" else null,
+                                stackId = stack.id,
+                                stackTitle = stack.title,
+                                sourceDomain = stack.sourceDomain,
+                                sourceUrl = stack.sourceUrl
+                            )
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error syncing with pocket repository", e)
+        }
+
+        val completedById = finishedItems.associateBy { it.id }
+        val completedByUrl = finishedItems.filter { it.mediaUrl.isNotBlank() }.associateBy { it.mediaUrl }
+        val reconciledActivities = _activities.value.map { activity ->
+            val completed = completedById[activity.id] ?: completedByUrl[activity.mediaUrl]
+            if (completed != null && activity.status != DownloadActivityStatus.FINISHED) {
+                completed.copy(
+                    workId = activity.workId ?: completed.workId,
+                    retryCount = activity.retryCount,
+                    maxRetries = activity.maxRetries
+                )
+            } else activity
+        }
+        val activeOrFailed = reconciledActivities.filter { it.status != DownloadActivityStatus.FINISHED }
+        // Prefer Pocket/inbox metadata over generic storage history for an identical local file.
+        val allFinished = (finishedItems + reconciledActivities.filter { it.status == DownloadActivityStatus.FINISHED })
+            .distinctBy { it.localUri?.takeIf { uri -> uri.isNotBlank() } ?: it.id }
 
         // Combined ordered: downloading first, retrying second, paused third, failed fourth, then finished newest first
-        _activities.value = (activeOrFailed + allFinished).distinctBy { it.id }.sortedWith(
+        val sortedActivities = (activeOrFailed + allFinished).distinctBy { it.id }.sortedWith(
             compareBy<DownloadActivityItem> {
                 when (it.status) {
                     DownloadActivityStatus.DOWNLOADING -> 0
@@ -305,6 +465,10 @@ object DownloadActivityManager {
                 }
             }.thenByDescending { it.timestampMillis }
         )
+        if (sortedActivities != _activities.value) {
+            _activities.value = sortedActivities
+            persistActivities()
+        }
     }
 
     /**
@@ -316,7 +480,17 @@ object DownloadActivityManager {
         try {
             val storageDir = OkHttpDownloader.getTargetStorageDir(ctx)
             if (!storageDir.exists() || !storageDir.isDirectory) return
-            val files = storageDir.listFiles() ?: return
+            val files = storageDir.walkTopDown()
+                .onEnter { directory -> directory == storageDir || !directory.name.equals(".ffmpeg-staging", ignoreCase = true) }
+                .filter { file ->
+                    val name = file.name.lowercase(Locale.ROOT)
+                    file.isFile && file.length() > 0L && !name.startsWith(".") &&
+                        !name.endsWith(".download") && !name.endsWith(".downloading") &&
+                        !name.endsWith(".tmp") && !name.endsWith(".meta") &&
+                        !name.endsWith(".part") && !name.endsWith(".partial") &&
+                        !name.contains(".part.") && !name.endsWith(".publishing")
+                }
+                .toList()
 
             val current = _activities.value.toMutableList()
             val existingLocalUris = current.mapNotNull { it.localUri }.toSet()
@@ -324,34 +498,55 @@ object DownloadActivityManager {
 
             var modified = false
             for (file in files) {
-                if (file.isFile && file.length() > 0 && !file.name.endsWith(".download") && !file.name.endsWith(".tmp")) {
-                    val fileUri = Uri.fromFile(file).toString()
-                    val fileName = file.name
-                    if (fileUri !in existingLocalUris && fileName.lowercase(Locale.ROOT) !in existingTitles) {
-                        val isVideo = fileName.endsWith(".mp4", true) || fileName.endsWith(".webm", true) || fileName.endsWith(".mkv", true)
-                        val isAudio = fileName.endsWith(".mp3", true) || fileName.endsWith(".m4a", true) || fileName.endsWith(".wav", true) || fileName.endsWith(".aac", true)
-                        val ext = file.extension.uppercase(Locale.ROOT).ifBlank { if (isVideo) "MP4" else if (isAudio) "MP3" else "JPG" }
+                val fileUri = Uri.fromFile(file).toString()
+                val filePath = file.absolutePath
+                val fileName = file.name
 
-                        current.add(
-                            DownloadActivityItem(
-                                id = "storage_${file.name.hashCode()}_${file.lastModified()}",
-                                title = fileName,
-                                mediaUrl = fileUri,
-                                thumbnailUrl = fileUri,
-                                localUri = fileUri,
-                                isVideo = isVideo,
-                                isAudio = isAudio,
-                                isStream = false,
-                                format = ext,
-                                status = DownloadActivityStatus.FINISHED,
-                                progress = 1.0f,
-                                bytesRead = file.length(),
-                                totalBytes = file.length(),
-                                timestampMillis = file.lastModified()
-                            )
+                // Check if an existing activity corresponds to this saved file
+                val matchingIndex = current.indexOfFirst { act ->
+                    act.localUri == fileUri || act.localUri == filePath ||
+                        act.id == file.nameWithoutExtension ||
+                        (act.mediaUrl.isNotBlank() && file.name.contains(abs(act.mediaUrl.hashCode()).toString(16), ignoreCase = true)) ||
+                        (!isGenericName(act.title) && act.title.equals(fileName, ignoreCase = true))
+                }
+
+                if (matchingIndex >= 0) {
+                    val act = current[matchingIndex]
+                    if (act.status != DownloadActivityStatus.FINISHED || act.localUri != fileUri) {
+                        current[matchingIndex] = act.copy(
+                            status = DownloadActivityStatus.FINISHED,
+                            localUri = fileUri,
+                            progress = 1.0f,
+                            bytesRead = file.length(),
+                            totalBytes = file.length(),
+                            speedBytesPerSec = 0L
                         )
                         modified = true
                     }
+                } else if (fileUri !in existingLocalUris && filePath !in existingLocalUris && fileName.lowercase(Locale.ROOT) !in existingTitles) {
+                    val isVideo = fileName.endsWith(".mp4", true) || fileName.endsWith(".webm", true) || fileName.endsWith(".mkv", true)
+                    val isAudio = fileName.endsWith(".mp3", true) || fileName.endsWith(".m4a", true) || fileName.endsWith(".wav", true) || fileName.endsWith(".aac", true)
+                    val ext = file.extension.uppercase(Locale.ROOT).ifBlank { if (isVideo) "MP4" else if (isAudio) "MP3" else "JPG" }
+
+                    current.add(
+                        DownloadActivityItem(
+                            id = "storage_${file.name.hashCode()}_${file.lastModified()}",
+                            title = fileName,
+                            mediaUrl = fileUri,
+                            thumbnailUrl = fileUri,
+                            localUri = fileUri,
+                            isVideo = isVideo,
+                            isAudio = isAudio,
+                            isStream = false,
+                            format = ext,
+                            status = DownloadActivityStatus.FINISHED,
+                            progress = 1.0f,
+                            bytesRead = file.length(),
+                            totalBytes = file.length(),
+                            timestampMillis = file.lastModified()
+                        )
+                    )
+                    modified = true
                 }
             }
 
@@ -390,8 +585,27 @@ object DownloadActivityManager {
         sourceDomain: String? = null,
         sourceUrl: String? = null
     ) {
+        val context = appContext
+        val existingFile = if (context != null) {
+            OkHttpDownloader.findExistingSavedFile(
+                context = context,
+                mediaUrl = mediaUrl,
+                fileName = title,
+                downloadId = id,
+                domain = sourceDomain
+            )
+        } else null
+
+        val isAlreadyFinished = existingFile != null && existingFile.exists() && existingFile.length() > 0L
+        synchronized(stateLock) {
         val current = _activities.value.toMutableList()
         val existing = current.firstOrNull { it.id == id }
+        val initialStatus = if (isAlreadyFinished) DownloadActivityStatus.FINISHED else (if (existing?.status == DownloadActivityStatus.FINISHED) DownloadActivityStatus.FINISHED else DownloadActivityStatus.DOWNLOADING)
+        val resolvedLocalUri = if (isAlreadyFinished) Uri.fromFile(existingFile).toString() else existing?.localUri
+        val initialProgress = if (isAlreadyFinished) 1.0f else (existing?.progress ?: 0.05f)
+        val initialBytes = if (isAlreadyFinished) existingFile!!.length() else (existing?.bytesRead ?: 0L)
+        val initialTotal = if (isAlreadyFinished) existingFile!!.length() else (existing?.totalBytes ?: 0L)
+
         current.removeAll { it.id == id }
         current.add(
             0,
@@ -400,15 +614,16 @@ object DownloadActivityManager {
                 workId = workId,
                 title = title,
                 mediaUrl = mediaUrl,
-                thumbnailUrl = thumbnailUrl ?: mediaUrl,
+                thumbnailUrl = resolvedLocalUri ?: thumbnailUrl ?: mediaUrl,
+                localUri = resolvedLocalUri,
                 isVideo = isVideo,
                 isAudio = isAudio,
                 isStream = isStream,
                 format = format.ifBlank { if (isVideo) "MP4" else "JPG" },
-                status = DownloadActivityStatus.DOWNLOADING,
-                progress = existing?.progress ?: 0.05f,
-                bytesRead = existing?.bytesRead ?: 0L,
-                totalBytes = existing?.totalBytes ?: 0L,
+                status = initialStatus,
+                progress = initialProgress,
+                bytesRead = initialBytes,
+                totalBytes = initialTotal,
                 retryCount = if (isRetry) (existing?.retryCount ?: 0) else 0,
                 maxRetries = existing?.maxRetries ?: 5,
                 timestampMillis = System.currentTimeMillis(),
@@ -420,6 +635,7 @@ object DownloadActivityManager {
         )
         _activities.value = current
         persistActivities()
+        }
     }
 
     fun recordBatchQueued(
@@ -430,21 +646,37 @@ object DownloadActivityManager {
         sourceDomain: String? = null,
         sourceUrl: String? = null
     ) {
-        val current = _activities.value.toMutableList()
+        val context = appContext
         val newItems = items.mapIndexed { index, item ->
             val wId = workIds?.getOrNull(index)?.toString()
+            val existingFile = if (context != null) {
+                OkHttpDownloader.findExistingSavedFile(
+                    context = context,
+                    mediaUrl = item.url,
+                    fileName = item.title,
+                    downloadId = item.id,
+                    domain = sourceDomain
+                )
+            } else null
+            val isAlreadyFinished = existingFile != null && existingFile.exists() && existingFile.length() > 0L
+            val resolvedLocalUri = if (isAlreadyFinished) Uri.fromFile(existingFile).toString() else null
+            val size = if (isAlreadyFinished) existingFile!!.length() else 0L
+
             DownloadActivityItem(
                 id = item.id,
                 workId = wId,
                 title = item.title,
                 mediaUrl = item.url,
-                thumbnailUrl = item.thumbnailUrl ?: item.url,
+                thumbnailUrl = resolvedLocalUri ?: item.thumbnailUrl ?: item.url,
+                localUri = resolvedLocalUri,
                 isVideo = item.isVideo,
                 isAudio = item.isAudio,
                 isStream = item.isStream,
                 format = item.format.ifBlank { if (item.isVideo) "MP4" else "JPG" },
-                status = DownloadActivityStatus.DOWNLOADING,
-                progress = 0.05f,
+                status = if (isAlreadyFinished) DownloadActivityStatus.FINISHED else DownloadActivityStatus.DOWNLOADING,
+                progress = if (isAlreadyFinished) 1.0f else 0.05f,
+                bytesRead = size,
+                totalBytes = size,
                 timestampMillis = System.currentTimeMillis(),
                 stackId = stackId,
                 stackTitle = stackTitle,
@@ -453,10 +685,13 @@ object DownloadActivityManager {
             )
         }
         val newIds = newItems.map { it.id }.toSet()
-        current.removeAll { it.id in newIds }
-        current.addAll(0, newItems)
-        _activities.value = current
-        persistActivities()
+        synchronized(stateLock) {
+            val current = _activities.value.toMutableList()
+            current.removeAll { it.id in newIds }
+            current.addAll(0, newItems)
+            _activities.value = current
+            persistActivities()
+        }
     }
 
     fun updateProgress(
@@ -466,19 +701,30 @@ object DownloadActivityManager {
         totalBytes: Long,
         speedBytesPerSec: Long = 0L
     ) {
-        val current = _activities.value
-        val index = current.indexOfFirst { it.id == itemId }
-        if (index >= 0) {
-            val updated = current.toMutableList()
-            val existing = updated[index]
-            updated[index] = existing.copy(
-                status = DownloadActivityStatus.DOWNLOADING,
-                progress = progress.coerceIn(0f, 1f),
-                bytesRead = bytesRead,
-                totalBytes = if (totalBytes > 0) totalBytes else existing.totalBytes,
-                speedBytesPerSec = speedBytesPerSec
-            )
-            _activities.value = updated
+        synchronized(stateLock) {
+            val current = _activities.value
+            val index = current.indexOfFirst { it.id == itemId }
+            if (index >= 0) {
+                val updated = current.toMutableList()
+                val existing = updated[index]
+                if (existing.status == DownloadActivityStatus.FINISHED) {
+                    return
+                }
+                // A user pause/cancel must not be flipped back to DOWNLOADING by a late progress tick.
+                if (existing.status == DownloadActivityStatus.PAUSED ||
+                    (existing.status == DownloadActivityStatus.FAILED && existing.errorMessage == "Cancelled by user")
+                ) {
+                    return
+                }
+                updated[index] = existing.copy(
+                    status = DownloadActivityStatus.DOWNLOADING,
+                    progress = progress.coerceIn(0f, 1f),
+                    bytesRead = bytesRead,
+                    totalBytes = if (totalBytes > 0) totalBytes else existing.totalBytes,
+                    speedBytesPerSec = speedBytesPerSec
+                )
+                _activities.value = updated
+            }
         }
     }
 
@@ -487,21 +733,29 @@ object DownloadActivityManager {
         localUri: String,
         sizeBytes: Long
     ) {
-        val current = _activities.value.toMutableList()
-        val index = current.indexOfFirst { it.id == itemId }
-        if (index >= 0) {
-            val existing = current[index]
-            current[index] = existing.copy(
-                status = DownloadActivityStatus.FINISHED,
-                progress = 1.0f,
-                localUri = localUri,
-                bytesRead = sizeBytes,
-                totalBytes = sizeBytes,
-                timestampMillis = System.currentTimeMillis()
-            )
+        synchronized(stateLock) {
+            val current = _activities.value.toMutableList()
+            val index = current.indexOfFirst { it.id == itemId }
+            if (index >= 0) {
+                val existing = current[index]
+                current[index] = existing.copy(
+                    status = DownloadActivityStatus.FINISHED,
+                    progress = 1.0f,
+                    localUri = localUri,
+                    bytesRead = sizeBytes,
+                    totalBytes = sizeBytes,
+                    speedBytesPerSec = 0L,
+                    errorMessage = null,
+                    nextRetryTimestampMillis = null,
+                    retryDelaySeconds = null,
+                    timestampMillis = System.currentTimeMillis()
+                )
+            }
+            _activities.value = current
+            persistActivities()
         }
-        _activities.value = current
-        persistActivities()
+        activeRetryJobs[itemId]?.cancel()
+        activeRetryJobs.remove(itemId)
         syncWithInboxRepository()
     }
 
@@ -521,7 +775,13 @@ object DownloadActivityManager {
                 msg.contains("network") ||
                 msg.contains("socket") ||
                 msg.contains("broken pipe") ||
-                msg.contains("429")
+                msg.contains("interrupted") ||
+                msg.contains("unexpected end of stream") ||
+                msg.contains("stream was reset") ||
+                msg.contains("unable to resolve host") ||
+                msg.contains("size mismatch") ||
+                msg.contains("429") ||
+                Regex("""http status 5\d\d""").containsMatchIn(msg)
             ) {
                 return true
             }
@@ -562,51 +822,60 @@ object DownloadActivityManager {
         errorMessage: String?,
         retryAfterSeconds: Long?
     ): Boolean {
-        val current = _activities.value.toMutableList()
-        val index = current.indexOfFirst { it.id == itemId }
-        if (index < 0) return false
+        var scheduleDelaySec: Long? = null
+        val result: Boolean
+        synchronized(stateLock) {
+            val current = _activities.value.toMutableList()
+            val index = current.indexOfFirst { it.id == itemId }
+            if (index < 0) return false
 
-        val item = current[index]
-        if (item.status == DownloadActivityStatus.PAUSED ||
-            item.status == DownloadActivityStatus.FINISHED ||
-            item.errorMessage == "Cancelled by user"
-        ) {
-            Log.d(TAG, "Ignoring failure callback for item $itemId with status ${item.status}")
-            return false
-        }
+            val item = current[index]
+            if (item.status == DownloadActivityStatus.PAUSED ||
+                item.status == DownloadActivityStatus.FINISHED ||
+                item.errorMessage == "Cancelled by user"
+            ) {
+                Log.d(TAG, "Ignoring failure callback for item $itemId with status ${item.status}")
+                return false
+            }
 
-        val isTransient = isTemporaryFailure(statusCode, errorMessage)
-        val nextAttempt = item.retryCount + 1
+            val isTransient = isTemporaryFailure(statusCode, errorMessage)
+            val nextAttempt = item.retryCount + 1
 
-        if (isTransient && nextAttempt <= item.maxRetries) {
-            val delaySec = calculateRetryDelaySeconds(nextAttempt, retryAfterSeconds)
-            val nextRetryEpoch = System.currentTimeMillis() + (delaySec * 1000L)
-            current[index] = item.copy(
-                status = DownloadActivityStatus.RETRYING,
-                retryCount = nextAttempt,
-                maxRetries = 5,
-                nextRetryTimestampMillis = nextRetryEpoch,
-                retryDelaySeconds = delaySec,
-                errorMessage = null // Never mark as failed until all 5 automatic retries conclude
-            )
+            if (isTransient && nextAttempt <= item.maxRetries) {
+                val delaySec = calculateRetryDelaySeconds(nextAttempt, retryAfterSeconds)
+                val nextRetryEpoch = System.currentTimeMillis() + (delaySec * 1000L)
+                current[index] = item.copy(
+                    status = DownloadActivityStatus.RETRYING,
+                    retryCount = nextAttempt,
+                    maxRetries = 5,
+                    nextRetryTimestampMillis = nextRetryEpoch,
+                    retryDelaySeconds = delaySec,
+                    speedBytesPerSec = 0L,
+                    errorMessage = null // Never mark as failed until all 5 automatic retries conclude
+                )
+                scheduleDelaySec = delaySec
+                result = true
+            } else {
+                // Retries exhausted or non-transient error: stop automatic attempts, allow manual retry
+                current[index] = item.copy(
+                    status = DownloadActivityStatus.FAILED,
+                    nextRetryTimestampMillis = null,
+                    retryDelaySeconds = null,
+                    speedBytesPerSec = 0L,
+                    errorMessage = errorMessage ?: "Download failed"
+                )
+                result = false
+            }
             _activities.value = current
             persistActivities()
-            scheduleRetryExecution(context, itemId, delaySec)
-            return true
+        }
+        if (scheduleDelaySec != null) {
+            scheduleRetryExecution(context, itemId, scheduleDelaySec!!)
         } else {
-            // Retries exhausted or non-transient error: stop automatic attempts, allow manual retry
             activeRetryJobs[itemId]?.cancel()
             activeRetryJobs.remove(itemId)
-            current[index] = item.copy(
-                status = DownloadActivityStatus.FAILED,
-                nextRetryTimestampMillis = null,
-                retryDelaySeconds = null,
-                errorMessage = errorMessage ?: "Download failed"
-            )
-            _activities.value = current
-            persistActivities()
-            return false
         }
+        return result
     }
 
     /**
@@ -616,7 +885,7 @@ object DownloadActivityManager {
         // Prevent duplicate retry requests
         activeRetryJobs[itemId]?.cancel()
 
-        val job = scope.launch {
+        val job = scope.launch(Dispatchers.IO) {
             if (delaySeconds > 0L) {
                 delay(delaySeconds * 1000L)
             }
@@ -630,20 +899,35 @@ object DownloadActivityManager {
     }
 
     private fun executeScheduledRetry(context: Context, item: DownloadActivityItem) {
-        val current = _activities.value.toMutableList()
-        val index = current.indexOfFirst { it.id == item.id }
-        if (index < 0) return
-
-        val existing = current[index]
-        if (existing.status == DownloadActivityStatus.DOWNLOADING) return
-
-        current[index] = existing.copy(
-            status = DownloadActivityStatus.DOWNLOADING,
-            nextRetryTimestampMillis = null,
-            retryDelaySeconds = null
+        val savedFile = OkHttpDownloader.findExistingSavedFile(
+            context = context,
+            mediaUrl = item.mediaUrl,
+            fileName = item.title,
+            downloadId = item.id,
+            domain = item.sourceDomain
         )
-        _activities.value = current
-        persistActivities()
+        if (savedFile != null && savedFile.exists() && savedFile.length() > 0L) {
+            markFinished(item.id, Uri.fromFile(savedFile).toString(), savedFile.length())
+            return
+        }
+
+        synchronized(stateLock) {
+            val current = _activities.value.toMutableList()
+            val index = current.indexOfFirst { it.id == item.id }
+            if (index < 0) return
+            val existing = current[index]
+            if (existing.status == DownloadActivityStatus.DOWNLOADING || existing.status == DownloadActivityStatus.FINISHED) return
+            // The user may have paused / cancelled while this retry was waiting out its backoff.
+            if (existing.status != DownloadActivityStatus.RETRYING) return
+            current[index] = existing.copy(
+                status = DownloadActivityStatus.DOWNLOADING,
+                nextRetryTimestampMillis = null,
+                retryDelaySeconds = null,
+                timestampMillis = System.currentTimeMillis()
+            )
+            _activities.value = current
+            persistActivities()
+        }
 
         val scraped = ScrapedMediaItem(
             id = item.id,
@@ -665,12 +949,69 @@ object DownloadActivityManager {
             sourceUrl = item.sourceUrl,
             isRetry = true
         )
-        val reloaded = _activities.value.toMutableList()
-        val idx = reloaded.indexOfFirst { it.id == item.id }
-        if (idx >= 0) {
-            reloaded[idx] = reloaded[idx].copy(workId = workId.toString())
-            _activities.value = reloaded
-            persistActivities()
+        synchronized(stateLock) {
+            val reloaded = _activities.value.toMutableList()
+            val idx = reloaded.indexOfFirst { it.id == item.id }
+            if (idx >= 0) {
+                reloaded[idx] = reloaded[idx].copy(workId = workId.toString())
+                _activities.value = reloaded
+                persistActivities()
+            }
+        }
+    }
+
+    /**
+     * Safety net for the "downloading forever" state. Every few seconds, any item shown as
+     * DOWNLOADING whose WorkManager job is no longer alive (finished, cancelled, pruned, or killed
+     * together with the process) is reconciled: finished if the file exists, otherwise sent through
+     * the normal failure/auto-retry path so it can never spin indefinitely with nothing running.
+     */
+    private fun startStuckDownloadWatchdog(context: Context) {
+        if (stuckWatchdogJob?.isActive == true) return
+        stuckWatchdogJob = scope.launch(Dispatchers.IO) {
+            delay(8_000L)
+            while (isActive) {
+                runCatching { reconcileStuckDownloads(context) }
+                    .onFailure { Log.w(TAG, "Stuck-download reconcile failed: ${it.message}") }
+                delay(20_000L)
+            }
+        }
+    }
+
+    private fun reconcileStuckDownloads(context: Context) {
+        val wm = runCatching { WorkManager.getInstance(context) }.getOrNull() ?: return
+        val now = System.currentTimeMillis()
+        val candidates = _activities.value.filter {
+            it.status == DownloadActivityStatus.DOWNLOADING && now - it.timestampMillis > 45_000L
+        }
+        for (item in candidates) {
+            val workState: WorkInfo.State? = item.workId
+                ?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+                ?.let { id -> runCatching { wm.getWorkInfoById(id).get(3, TimeUnit.SECONDS)?.state }.getOrNull() }
+            val alive = workState == WorkInfo.State.RUNNING ||
+                workState == WorkInfo.State.ENQUEUED ||
+                workState == WorkInfo.State.BLOCKED
+            if (alive) continue
+
+            val saved = OkHttpDownloader.findExistingSavedFile(
+                context = context,
+                mediaUrl = item.mediaUrl,
+                fileName = item.title,
+                downloadId = item.id,
+                domain = item.sourceDomain
+            )
+            if (saved != null && saved.exists() && saved.length() > 0L) {
+                markFinished(item.id, Uri.fromFile(saved).toString(), saved.length())
+            } else {
+                Log.w(TAG, "Download ${item.id} shows DOWNLOADING but its work is $workState; recovering")
+                handleDownloadFailure(
+                    context = context,
+                    itemId = item.id,
+                    statusCode = -1,
+                    errorMessage = "Download interrupted before completing",
+                    retryAfterSeconds = null
+                )
+            }
         }
     }
 
@@ -678,17 +1019,19 @@ object DownloadActivityManager {
         itemId: String,
         errorMessage: String
     ) {
-        val current = _activities.value.toMutableList()
-        val index = current.indexOfFirst { it.id == itemId }
-        if (index >= 0) {
-            val existing = current[index]
-            current[index] = existing.copy(
-                status = DownloadActivityStatus.FAILED,
-                errorMessage = errorMessage
-            )
+        synchronized(stateLock) {
+            val current = _activities.value.toMutableList()
+            val index = current.indexOfFirst { it.id == itemId }
+            if (index >= 0) {
+                val existing = current[index]
+                current[index] = existing.copy(
+                    status = DownloadActivityStatus.FAILED,
+                    errorMessage = errorMessage
+                )
+            }
+            _activities.value = current
+            persistActivities()
         }
-        _activities.value = current
-        persistActivities()
     }
 
     fun pauseDownload(context: Context, itemId: String) {
@@ -700,7 +1043,7 @@ object DownloadActivityManager {
             val existing = current[index]
             existing.workId?.let { wId ->
                 runCatching {
-                    DownloadQueueManager.cancelDownload(context, UUID.fromString(wId))
+                    DownloadQueueManager.cancelDownload(context, UUID.fromString(wId), itemId)
                 }
             }
             current[index] = existing.copy(
@@ -725,6 +1068,18 @@ object DownloadActivityManager {
             // Cancel any pending automatic retry to prevent duplicate requests
             activeRetryJobs[itemId]?.cancel()
             activeRetryJobs.remove(itemId)
+
+            val existingFile = OkHttpDownloader.findExistingSavedFile(
+                context = context,
+                mediaUrl = item.mediaUrl,
+                fileName = item.title,
+                downloadId = item.id,
+                domain = item.sourceDomain
+            )
+            if (existingFile != null && existingFile.exists() && existingFile.length() > 0L) {
+                markFinished(item.id, Uri.fromFile(existingFile).toString(), existingFile.length())
+                return
+            }
 
             val scraped = ScrapedMediaItem(
                 id = item.id,
@@ -849,5 +1204,11 @@ object DownloadActivityManager {
                 }.getOrDefault("Recent")
             }
         }
+    }
+
+    private fun isGenericName(name: String?): Boolean {
+        if (name.isNullOrBlank()) return true
+        val base = name.substringBeforeLast('.').lowercase(Locale.ROOT)
+        return base.length < 5 || base in setOf("image", "photo", "pic", "picture", "video", "thumb", "thumbnail", "default", "index", "master", "avatar", "logo", "icon", "download", "play", "track", "audio", "stream", "file", "item", "view", "1", "0", "hqdefault", "maxresdefault", "videoplayback", "preview", "media")
     }
 }

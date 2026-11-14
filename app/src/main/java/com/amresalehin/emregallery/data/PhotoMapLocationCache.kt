@@ -14,22 +14,75 @@ import org.osmdroid.util.GeoPoint
 import java.io.File
 
 /**
- * Persistent SQLite cache for image and video GPS metadata, including media with no GPS coordinates.
+ * Enriched provenance tracking how a photo location was matched and persisted.
+ */
+data class LocationProvenance(
+    val source: String? = null,
+    val matchMethod: String? = null,
+    val resolvedTimestamp: Long? = null,
+    val timestampSource: String? = null,
+    val sampleBeforeTime: Long? = null,
+    val sampleAfterTime: Long? = null,
+    val sampleGapMinutes: Double? = null,
+    val isEstimated: Boolean = false,
+    val exifWritten: Boolean = false
+)
+
+/**
+ * Persistent SQLite cache for image and video GPS metadata, including media with no GPS coordinates
+ * and match provenance metadata.
  */
 class PhotoMapLocationCache(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "photo_map_locations.db", null, 3) {
+    SQLiteOpenHelper(context.applicationContext, "photo_map_locations.db", null, 4) {
 
-    data class CachedLocation(val point: GeoPoint?)
+    init {
+        setWriteAheadLoggingEnabled(true)
+    }
+
+    override fun onConfigure(db: SQLiteDatabase) {
+        super.onConfigure(db)
+        db.enableWriteAheadLogging()
+    }
+
+    data class CachedLocation(
+        val point: GeoPoint?,
+        val provenance: LocationProvenance? = null
+    )
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
-            "CREATE TABLE IF NOT EXISTS photo_locations (uri TEXT PRIMARY KEY NOT NULL, latitude REAL, longitude REAL)"
+            """
+            CREATE TABLE IF NOT EXISTS photo_locations (
+                uri TEXT PRIMARY KEY NOT NULL,
+                latitude REAL,
+                longitude REAL,
+                source TEXT,
+                match_method TEXT,
+                resolved_timestamp INTEGER,
+                timestamp_source TEXT,
+                sample_before_time INTEGER,
+                sample_after_time INTEGER,
+                sample_gap_minutes REAL,
+                is_estimated INTEGER DEFAULT 0,
+                exif_written INTEGER DEFAULT 0
+            )
+            """.trimIndent()
         )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS photo_locations")
-        onCreate(db)
+        // Additive migration: preserve all cached coordinates across schema upgrades
+        if (oldVersion < 4) {
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN source TEXT") }
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN match_method TEXT") }
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN resolved_timestamp INTEGER") }
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN timestamp_source TEXT") }
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN sample_before_time INTEGER") }
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN sample_after_time INTEGER") }
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN sample_gap_minutes REAL") }
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN is_estimated INTEGER DEFAULT 0") }
+            runCatching { db.execSQL("ALTER TABLE photo_locations ADD COLUMN exif_written INTEGER DEFAULT 0") }
+        }
     }
 
     @Synchronized
@@ -38,46 +91,49 @@ class PhotoMapLocationCache(context: Context) :
     }
 
     @Synchronized
+    fun getLocation(uri: String): CachedLocation? {
+        readableDatabase.query(
+            "photo_locations",
+            ALL_COLUMNS,
+            "uri = ?",
+            arrayOf(uri),
+            null,
+            null,
+            null
+        ).use { cursor ->
+            if (cursor.moveToFirst()) {
+                return parseCursorRow(cursor)
+            }
+        }
+        return null
+    }
+
+    @Synchronized
     fun loadAll(): Map<String, CachedLocation> {
         val result = mutableMapOf<String, CachedLocation>()
         readableDatabase.query(
-            "photo_locations", arrayOf("uri", "latitude", "longitude"),
-            null, null, null, null, null
+            "photo_locations",
+            ALL_COLUMNS,
+            null,
+            null,
+            null,
+            null,
+            null
         ).use { cursor ->
             val uriColumn = cursor.getColumnIndexOrThrow("uri")
-            val latitudeColumn = cursor.getColumnIndexOrThrow("latitude")
-            val longitudeColumn = cursor.getColumnIndexOrThrow("longitude")
             while (cursor.moveToNext()) {
                 val uri = cursor.getString(uriColumn)
-                val hasCoordinates = !cursor.isNull(latitudeColumn) && !cursor.isNull(longitudeColumn)
-                val point = if (!hasCoordinates) {
-                    null
-                } else {
-                    val lat = cursor.getDouble(latitudeColumn)
-                    val lon = cursor.getDouble(longitudeColumn)
-                    if (
-                        lat.isFinite() && lon.isFinite() &&
-                        lat in -90.0..90.0 && lon in -180.0..180.0 &&
-                        !(lat == 0.0 && lon == 0.0)
-                    ) {
-                        GeoPoint(lat, lon)
-                    } else {
-                        null
-                    }
+                val location = parseCursorRow(cursor)
+                if (location != null) {
+                    result[uri] = location
                 }
-
-                // Old builds could cache (0, 0) as a real GPS coordinate. Do not turn
-                // an invalid coordinate into a permanent "no GPS" cache entry: omit it
-                // so the next scan re-reads the source metadata.
-                if (hasCoordinates && point == null) continue
-                result[uri] = CachedLocation(point)
             }
         }
         return result
     }
 
     @Synchronized
-    fun save(uri: String, point: GeoPoint?) {
+    fun save(uri: String, point: GeoPoint?, provenance: LocationProvenance? = null) {
         val values = ContentValues().apply {
             put("uri", uri)
             if (point == null) {
@@ -87,10 +143,90 @@ class PhotoMapLocationCache(context: Context) :
                 put("latitude", point.latitude)
                 put("longitude", point.longitude)
             }
+            if (provenance != null) {
+                put("source", provenance.source)
+                put("match_method", provenance.matchMethod)
+                if (provenance.resolvedTimestamp != null) {
+                    put("resolved_timestamp", provenance.resolvedTimestamp)
+                } else {
+                    putNull("resolved_timestamp")
+                }
+                put("timestamp_source", provenance.timestampSource)
+                if (provenance.sampleBeforeTime != null) {
+                    put("sample_before_time", provenance.sampleBeforeTime)
+                } else {
+                    putNull("sample_before_time")
+                }
+                if (provenance.sampleAfterTime != null) {
+                    put("sample_after_time", provenance.sampleAfterTime)
+                } else {
+                    putNull("sample_after_time")
+                }
+                if (provenance.sampleGapMinutes != null) {
+                    put("sample_gap_minutes", provenance.sampleGapMinutes)
+                } else {
+                    putNull("sample_gap_minutes")
+                }
+                put("is_estimated", if (provenance.isEstimated) 1 else 0)
+                put("exif_written", if (provenance.exifWritten) 1 else 0)
+            }
         }
         writableDatabase.insertWithOnConflict(
             "photo_locations", null, values, SQLiteDatabase.CONFLICT_REPLACE
         )
+    }
+
+    private fun parseCursorRow(cursor: android.database.Cursor): CachedLocation? {
+        val latitudeColumn = cursor.getColumnIndex("latitude")
+        val longitudeColumn = cursor.getColumnIndex("longitude")
+        val hasCoordinates = latitudeColumn >= 0 && longitudeColumn >= 0 &&
+            !cursor.isNull(latitudeColumn) && !cursor.isNull(longitudeColumn)
+
+        val point = if (!hasCoordinates) {
+            null
+        } else {
+            val lat = cursor.getDouble(latitudeColumn)
+            val lon = cursor.getDouble(longitudeColumn)
+            if (
+                lat.isFinite() && lon.isFinite() &&
+                lat in -90.0..90.0 && lon in -180.0..180.0 &&
+                !(lat == 0.0 && lon == 0.0)
+            ) {
+                GeoPoint(lat, lon)
+            } else {
+                null
+            }
+        }
+
+        // Old builds could cache (0, 0) as a real GPS coordinate. Do not turn
+        // an invalid coordinate into a permanent "no GPS" cache entry: omit it
+        if (hasCoordinates && point == null) return null
+
+        val sourceIdx = cursor.getColumnIndex("source")
+        val methodIdx = cursor.getColumnIndex("match_method")
+        val resolvedTsIdx = cursor.getColumnIndex("resolved_timestamp")
+        val tsSourceIdx = cursor.getColumnIndex("timestamp_source")
+        val beforeIdx = cursor.getColumnIndex("sample_before_time")
+        val afterIdx = cursor.getColumnIndex("sample_after_time")
+        val gapIdx = cursor.getColumnIndex("sample_gap_minutes")
+        val estimatedIdx = cursor.getColumnIndex("is_estimated")
+        val writtenIdx = cursor.getColumnIndex("exif_written")
+
+        val provenance = if (sourceIdx >= 0 || methodIdx >= 0) {
+            LocationProvenance(
+                source = if (sourceIdx >= 0 && !cursor.isNull(sourceIdx)) cursor.getString(sourceIdx) else null,
+                matchMethod = if (methodIdx >= 0 && !cursor.isNull(methodIdx)) cursor.getString(methodIdx) else null,
+                resolvedTimestamp = if (resolvedTsIdx >= 0 && !cursor.isNull(resolvedTsIdx)) cursor.getLong(resolvedTsIdx) else null,
+                timestampSource = if (tsSourceIdx >= 0 && !cursor.isNull(tsSourceIdx)) cursor.getString(tsSourceIdx) else null,
+                sampleBeforeTime = if (beforeIdx >= 0 && !cursor.isNull(beforeIdx)) cursor.getLong(beforeIdx) else null,
+                sampleAfterTime = if (afterIdx >= 0 && !cursor.isNull(afterIdx)) cursor.getLong(afterIdx) else null,
+                sampleGapMinutes = if (gapIdx >= 0 && !cursor.isNull(gapIdx)) cursor.getDouble(gapIdx) else null,
+                isEstimated = estimatedIdx >= 0 && cursor.getInt(estimatedIdx) == 1,
+                exifWritten = writtenIdx >= 0 && cursor.getInt(writtenIdx) == 1
+            )
+        } else null
+
+        return CachedLocation(point, provenance)
     }
 
     /**
@@ -121,8 +257,6 @@ class PhotoMapLocationCache(context: Context) :
         // Process in throttled batches with batched transactions to minimize disk sync and CPU usage
         val batchSize = 25
         for (batch in pending.chunked(batchSize)) {
-            // Parse media before starting the DB transaction. ContentResolver/EXIF I/O can be
-            // slow; holding a write lock during it blocks other location-cache readers/writers.
             val extracted = batch.map { item ->
                 item to extractLocation(context, item.uri, isVideo = item.isVideo)
             }
@@ -139,6 +273,9 @@ class PhotoMapLocationCache(context: Context) :
                         } else {
                             put("latitude", point.latitude)
                             put("longitude", point.longitude)
+                            put("source", "exif")
+                            put("match_method", "direct_exif")
+                            put("exif_written", 1)
                         }
                     }
                     db.insertWithOnConflict("photo_locations", null, values, SQLiteDatabase.CONFLICT_REPLACE)
@@ -157,10 +294,14 @@ class PhotoMapLocationCache(context: Context) :
     }
 
     companion object {
+        private val ALL_COLUMNS = arrayOf(
+            "uri", "latitude", "longitude", "source", "match_method",
+            "resolved_timestamp", "timestamp_source", "sample_before_time",
+            "sample_after_time", "sample_gap_minutes", "is_estimated", "exif_written"
+        )
+
         /**
          * Safely extracts latitude and longitude from an image URI's EXIF data or video metadata.
-         * Handles unredacted MediaStore URIs (via ACCESS_MEDIA_LOCATION and MediaStore.setRequireOriginal),
-         * seekable FileDescriptors, stream fallbacks, and ISO 6709 coordinates.
          */
         fun extractLocation(
             context: Context,
@@ -183,14 +324,13 @@ class PhotoMapLocationCache(context: Context) :
             }
 
             // On Android 10+ (API 29+), content URIs require MediaStore.setRequireOriginal(uri)
-            // with ACCESS_MEDIA_LOCATION to prevent stripping of EXIF GPS coordinates.
             val targetUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && uri.scheme == ContentResolver.SCHEME_CONTENT) {
                 runCatching { MediaStore.setRequireOriginal(uri) }.getOrDefault(uri)
             } else {
                 uri
             }
 
-            // 1. Try ExifInterface with FileDescriptor (handles seekable streams correctly for TIFF/EXIF headers)
+            // 1. Try ExifInterface with FileDescriptor
             val fromFd = runCatching {
                 context.contentResolver.openFileDescriptor(targetUri, "r")?.use { pfd ->
                     val exif = ExifInterface(pfd.fileDescriptor)
@@ -208,7 +348,7 @@ class PhotoMapLocationCache(context: Context) :
             }.getOrNull()
             if (fromStream != null) return fromStream
 
-            // 3. Fallback to original uri (in case setRequireOriginal failed due to provider quirks)
+            // 3. Fallback to original uri
             if (targetUri != uri) {
                 val fromOrigFd = runCatching {
                     context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
@@ -227,9 +367,6 @@ class PhotoMapLocationCache(context: Context) :
                 if (fromOrigStream != null) return fromOrigStream
             }
 
-            // Avoid spinning up native media decoders for photos. This fallback is for video
-            // container metadata (ISO 6709) only; invoking it for every photo without EXIF GPS
-            // is expensive across large libraries and can exhaust native media resources.
             if (isVideo) {
                 val fromMetadata = runCatching {
                     val retriever = MediaMetadataRetriever()
@@ -248,7 +385,6 @@ class PhotoMapLocationCache(context: Context) :
         }
 
         private fun getGeoPointFromExif(exif: ExifInterface): GeoPoint? {
-            // First check the standard latLong property
             val latLong = exif.latLong
             if (latLong != null && latLong.size >= 2) {
                 val lat = latLong[0]
@@ -258,7 +394,6 @@ class PhotoMapLocationCache(context: Context) :
                 }
             }
 
-            // Fallback: parse raw GPS EXIF tags manually if latLong parser failed
             val latStr = exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE)
             val latRef = exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE_REF)
             val lonStr = exif.getAttribute(ExifInterface.TAG_GPS_LONGITUDE)

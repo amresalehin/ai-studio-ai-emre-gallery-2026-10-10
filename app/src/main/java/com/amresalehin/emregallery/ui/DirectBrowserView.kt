@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Log
 import android.webkit.*
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
@@ -40,19 +41,32 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import android.app.Activity
 import android.os.Build
+import com.amresalehin.emregallery.data.AdBlockEngine
 import com.amresalehin.emregallery.data.BotDetectionMitigator
 import com.amresalehin.emregallery.data.BrowserHistoryManager
+import com.amresalehin.emregallery.data.RamGovernor
 import com.amresalehin.emregallery.data.BrowserSession
 import com.amresalehin.emregallery.data.BrowserShortcut
 import com.amresalehin.emregallery.data.BrowserTabItem
+import com.amresalehin.emregallery.data.DownloadQueueManager
 import com.amresalehin.emregallery.data.DownloaderSession
 import com.amresalehin.emregallery.data.ExtractionSource
 import com.amresalehin.emregallery.data.MediaCaptureEngine
+import com.amresalehin.emregallery.data.MediaCategory
 import com.amresalehin.emregallery.data.MediaClassifier
+import com.amresalehin.emregallery.data.MediaProvenance
+import com.amresalehin.emregallery.data.OkHttpDownloader
+import com.amresalehin.emregallery.data.PocketDeepScanEngine
 import com.amresalehin.emregallery.data.PreferencesRepository
 import com.amresalehin.emregallery.data.ScrapedMediaItem
+import android.webkit.URLUtil
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.URL
+import java.util.concurrent.atomic.AtomicReference
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -91,19 +105,28 @@ fun DirectBrowserView(
     val tabsList by historyManager.openTabs.collectAsState(initial = historyManager.defaultTabs)
 
     val startUrl = remember {
+        val savedSite = BrowserSession.savedBrowserSite.trim()
         val trimmed = initialUrl.trim()
-        if (trimmed.isNotBlank()) {
-            MediaClassifier.formatQueryOrUrl(trimmed)
-        } else {
-            "" // Clean monochrome home page by default
+        when {
+            savedSite.isNotBlank() -> savedSite
+            trimmed.isNotBlank() -> MediaClassifier.formatQueryOrUrl(trimmed)
+            else -> "" // Clean monochrome home page by default
         }
     }
 
+    // Discovery & Deep Scan states
+    var isDeepScanning by remember { mutableStateOf(false) }
+    var hasInitiatedScanInStage by remember { mutableStateOf(false) }
+    var deepScanJob by remember { mutableStateOf<Job?>(null) }
+
     var currentUrl by remember { mutableStateOf(startUrl) }
-    val totalDetectedCount = if (currentUrl.isBlank() || currentUrl == "about:blank") {
-        0
-    } else {
-        maxOf(tabDetectedCount, sessionDiscoveredItems.size)
+    val currentPageUrlRef = remember { AtomicReference(startUrl) }
+    LaunchedEffect(currentUrl) {
+        currentPageUrlRef.set(currentUrl)
+    }
+    val totalDetectedCount = remember(currentUrl, tabDetectedCount, sessionDiscoveredItems.size) {
+        if (currentUrl.isBlank() || currentUrl == "about:blank") 0
+        else maxOf(tabDetectedCount, sessionDiscoveredItems.size)
     }
     var addressInput by remember { mutableStateOf(startUrl) }
     var pageTitle by remember { mutableStateOf("") }
@@ -114,6 +137,7 @@ fun DirectBrowserView(
     var isDesktopMode by remember { mutableStateOf(false) }
 
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+    var webViewRecreateEpoch by remember { mutableIntStateOf(0) }
 
     // Dialog & Sheet States
     var showAddShortcutDialog by remember { mutableStateOf(false) }
@@ -121,6 +145,52 @@ fun DirectBrowserView(
     var showHistorySheet by remember { mutableStateOf(false) }
     var showTabsSheet by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
+    var showDiscoveredMediaOverlay by remember { mutableStateOf(false) }
+    var activeTabId by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(tabsList) {
+        if (tabsList.isEmpty()) {
+            val newId = "tab_${System.currentTimeMillis()}"
+            val initialTab = BrowserTabItem(
+                id = newId,
+                title = if (pageTitle.isNotBlank()) pageTitle else if (currentUrl.isNotBlank()) MediaClassifier.cleanDomainFromUrl(currentUrl) else "Home",
+                url = currentUrl
+            )
+            activeTabId = newId
+            historyManager.saveTabs(listOf(initialTab))
+        } else if (activeTabId == null || tabsList.none { it.id == activeTabId }) {
+            val matching = tabsList.firstOrNull { it.url.isNotBlank() && it.url.equals(currentUrl, ignoreCase = true) }
+                ?: tabsList.first()
+            activeTabId = matching.id
+        }
+    }
+
+    fun syncCurrentTabWithPage(targetUrl: String, targetTitle: String) {
+        val tabId = activeTabId ?: return
+        val currentTabs = tabsList
+        val existing = currentTabs.firstOrNull { it.id == tabId }
+        val displayTitle = if (targetTitle.isNotBlank() && targetTitle != "about:blank") {
+            targetTitle
+        } else if (targetUrl.isNotBlank() && targetUrl != "about:blank") {
+            MediaClassifier.cleanDomainFromUrl(targetUrl)
+        } else {
+            "Home"
+        }
+        val cleanUrl = if (targetUrl == "about:blank") "" else targetUrl
+        if (existing == null || existing.url != cleanUrl || existing.title != displayTitle) {
+            val updatedTabs = if (existing == null) {
+                currentTabs + BrowserTabItem(id = tabId, title = displayTitle, url = cleanUrl)
+            } else {
+                currentTabs.map {
+                    if (it.id == tabId) it.copy(title = displayTitle, url = cleanUrl, timestamp = System.currentTimeMillis())
+                    else it
+                }
+            }
+            coroutineScope.launch {
+                historyManager.saveTabs(updatedTabs)
+            }
+        }
+    }
 
     val currentView = LocalView.current
     DisposableEffect(isDark) {
@@ -153,60 +223,82 @@ fun DirectBrowserView(
         onDispose {
             webViewInstance?.let { wv ->
                 wv.stopLoading()
+                wv.loadUrl("about:blank")
+                wv.onPause()
                 wv.webViewClient = WebViewClient()
                 wv.webChromeClient = WebChromeClient()
-                wv.destroy()
+                wv.post {
+                    try { wv.destroy() } catch (_: Throwable) {}
+                }
                 webViewInstance = null
             }
         }
     }
 
-    // Intercept back button when browser can navigate back, or return to home
-    BackHandler(enabled = canGoBack || currentUrl.isNotBlank() || onClose != null) {
+    fun returnToBrowserHome() {
+        currentUrl = ""
+        currentPageUrlRef.set("")
+        addressInput = ""
+        pageTitle = ""
+        canGoBack = false
+        canGoForward = false
+        onUrlChange?.invoke("")
+        tabSession.clearMedia()
+        tabSession.updateNavigation("")
+        DownloaderSession.clear()
+        scrollHandler.show()
+        webViewInstance?.clearHistory()
+        webViewInstance?.loadUrl("about:blank")
+    }
+
+    // Synchronized back navigation for DirectBrowserView (shared by native BackHandler and search bar back button)
+    fun handleBrowserBackNavigation() {
         when {
+            showDiscoveredMediaOverlay -> {
+                showDiscoveredMediaOverlay = false
+                deepScanJob?.cancel()
+                deepScanJob = null
+                isDeepScanning = false
+                hasInitiatedScanInStage = false
+            }
             showHistorySheet -> showHistorySheet = false
             showTabsSheet -> showTabsSheet = false
             showSettingsSheet -> showSettingsSheet = false
             showAddShortcutDialog -> showAddShortcutDialog = false
             selectedShortcutForEdit != null -> selectedShortcutForEdit = null
-            canGoBack && webViewInstance?.canGoBack() == true -> webViewInstance?.goBack()
             currentUrl.isNotBlank() -> {
-                currentUrl = ""
-                addressInput = ""
-                pageTitle = ""
-                onUrlChange?.invoke("")
-                tabSession.clearMedia()
-                tabSession.updateNavigation("")
-                DownloaderSession.clear()
-                webViewInstance?.loadUrl("about:blank")
+                if (canGoBack && webViewInstance?.canGoBack() == true) {
+                    webViewInstance?.goBack()
+                } else {
+                    returnToBrowserHome()
+                }
             }
             onClose != null -> onClose()
         }
     }
 
-    fun navigateToUrl(target: String) {
-        val trimmed = target.trim()
-        if (trimmed.isBlank()) return
-        scrollHandler.show()
-        val formatted = MediaClassifier.formatQueryOrUrl(trimmed)
-        tabSession.clearMedia()
-        DownloaderSession.clear()
-        addressInput = formatted
-        currentUrl = formatted
-        onUrlChange?.invoke(formatted)
-        tabSession.updateNavigation(formatted, pageTitle)
-        DownloaderSession.updateBrowserPage(formatted)
-        coroutineScope.launch {
-            historyManager.recordVisit(formatted)
-        }
-        webViewInstance?.loadUrl(formatted)
-        focusManager.clearFocus()
+    // Intercept back button when browser can navigate back, return to home, dismiss a sheet, or exit the browser
+    BackHandler(
+        enabled = showDiscoveredMediaOverlay || showHistorySheet || showTabsSheet || showSettingsSheet ||
+                showAddShortcutDialog || selectedShortcutForEdit != null ||
+                currentUrl.isNotBlank() || onClose != null
+    ) {
+        handleBrowserBackNavigation()
     }
 
-    fun scanCurrentPageDOM(wv: WebView?) {
-        if (wv == null) return
-        val current = wv.url ?: return
-        if (current.isBlank() || current == "about:blank" || currentUrl.isBlank()) return
+    fun scanCurrentPageDOM(wv: WebView?, onCompleted: (() -> Unit)? = null) {
+        if (wv == null) {
+            onCompleted?.invoke()
+            return
+        }
+        val current = wv.url ?: run {
+            onCompleted?.invoke()
+            return
+        }
+        if (current.isBlank() || current == "about:blank" || currentUrl.isBlank()) {
+            onCompleted?.invoke()
+            return
+        }
 
         wv.evaluateJavascript(MediaCaptureEngine.getJsDomScanScript()) { jsonRaw ->
             val discovered = MediaCaptureEngine.parseJsDomScanResult(jsonRaw, current)
@@ -216,7 +308,214 @@ fun DirectBrowserView(
                 onBatchExtracted(discovered, pageTitle, domain)
                 DownloaderSession.addDiscoveredItems(discovered, pageTitle)
             }
+            onCompleted?.invoke()
         }
+    }
+
+    fun stopBrowserDeepScan() {
+        deepScanJob?.cancel()
+        deepScanJob = null
+        PocketDeepScanEngine.stopScan()
+        isDeepScanning = false
+    }
+
+    fun startBrowserDeepScan() {
+        val current = currentUrl.ifBlank { webViewInstance?.url.orEmpty() }
+        if (current.isBlank() || current == "about:blank") return
+
+        stopBrowserDeepScan()
+        isDeepScanning = true
+        hasInitiatedScanInStage = true
+
+        // 1. Immediately scan active DOM on the visible WebView WITHOUT any visual scrolling
+        // Promote lazy attributes in-place without moving the visible viewport
+        webViewInstance?.let { wv ->
+            wv.evaluateJavascript(
+                """
+                (function() {
+                    try {
+                        var lazyImgs = document.querySelectorAll('img[data-src], img[data-original], img[data-lazy], img[data-url], img[data-highres]');
+                        for (var i = 0; i < lazyImgs.length; i++) {
+                            var img = lazyImgs[i];
+                            var realSrc = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-lazy') || img.getAttribute('data-url') || img.getAttribute('data-highres');
+                            if (realSrc && !img.src) img.src = realSrc;
+                        }
+                        var lazyVideos = document.querySelectorAll('video[data-src], source[data-src], video[data-url], source[data-url]');
+                        for (var j = 0; j < lazyVideos.length; j++) {
+                            var v = lazyVideos[j];
+                            var vSrc = v.getAttribute('data-src') || v.getAttribute('data-url');
+                            if (vSrc && !v.src) v.src = vSrc;
+                        }
+                        window.dispatchEvent(new Event('scroll'));
+                        window.dispatchEvent(new Event('resize'));
+                    } catch(e) {}
+                })();
+                """.trimIndent(),
+                null
+            )
+            scanCurrentPageDOM(wv)
+        }
+
+        // 2. Run isolated background deep scan with full scrolling & JS offscreen
+        // The active browser viewport NEVER scrolls; the user's reading view remains 100% still!
+        PocketDeepScanEngine.startScan(
+            context = context,
+            bookmarkId = "browser_active_${System.currentTimeMillis()}",
+            targetUrl = current,
+            maxScanDurationMs = 30_000L,
+            scope = coroutineScope,
+            onIncrementalMediaDiscovered = { newItems ->
+                val domain = runCatching { URL(current).host }.getOrDefault("")
+                val defaultHeaders = buildMap {
+                    put("Referer", current)
+                    put("User-Agent", OkHttpDownloader.DEFAULT_USER_AGENT)
+                    val cookieStr = OkHttpDownloader.sharedCookieJar.getCookieString(current)
+                    if (cookieStr.isNotBlank()) put("Cookie", cookieStr)
+                }
+                val scraped = newItems.map { item ->
+                    val built = MediaCaptureEngine.buildMediaItem(
+                        rawUrl = item.sourceUrl,
+                        source = ExtractionSource.DOM_SCRAPE,
+                        baseUrl = current,
+                        poster = item.thumbnailUrl.ifBlank { null },
+                        titleHint = item.title.ifBlank { pageTitle },
+                        customId = item.id.ifBlank { null }
+                    )
+                    val resolvedClassification = MediaClassifier.classify(item.sourceUrl)
+                    (built ?: ScrapedMediaItem(
+                        id = item.id.ifBlank { "deep_${item.sourceUrl.hashCode()}" },
+                        url = item.sourceUrl,
+                        title = item.title.ifBlank { pageTitle },
+                        source = ExtractionSource.DOM_SCRAPE.label,
+                        isVideo = item.isVideo || item.isStream,
+                        isAudio = item.isAudio,
+                        isStream = item.isStream,
+                        category = resolvedClassification.category,
+                        format = item.format.ifBlank { resolvedClassification.format },
+                        thumbnailUrl = item.thumbnailUrl.ifBlank { null },
+                        mimeType = resolvedClassification.mimeType,
+                        downloadHeaders = defaultHeaders
+                    )).copy(
+                        sizeBytes = maxOf(built?.sizeBytes ?: 0L, item.sizeBytes),
+                        downloadHeaders = built?.downloadHeaders?.takeIf { it.isNotEmpty() } ?: defaultHeaders,
+                        format = item.format.ifBlank { built?.format ?: resolvedClassification.format },
+                        thumbnailUrl = item.thumbnailUrl.ifBlank { built?.thumbnailUrl ?: "" }.ifBlank { null },
+                        provenance = MediaProvenance(extractorEngine = "PocketDeepScan", pageUrl = current)
+                    )
+                }
+                tabSession.registerMediaBatch(scraped, pageTitle)
+                onBatchExtracted(scraped, pageTitle, domain)
+                DownloaderSession.addDiscoveredItems(scraped, pageTitle)
+            },
+            onCompleted = {
+                isDeepScanning = false
+            }
+        )
+    }
+
+    fun handleDiscoveredMediaClick() {
+        if (!hasInitiatedScanInStage) {
+            // First tap: Do NOT open the discovery page immediately.
+            // On tapping update media counts via explicitly requested 30s deep scan.
+            startBrowserDeepScan()
+        } else {
+            // Tapping discover button again in this stage opens the discovery page.
+            stopBrowserDeepScan()
+
+            val wv = webViewInstance
+            val site = currentUrl.ifBlank { wv?.url.orEmpty() }
+
+            // Save last scroll position and site before opening discovery page
+            val scrollX = wv?.scrollX ?: 0
+            val scrollY = wv?.scrollY ?: 0
+
+            BrowserSession.savedBrowserSite = site
+            BrowserSession.savedScrollX = scrollX
+            BrowserSession.savedScrollY = scrollY
+            BrowserSession.pendingScrollRestore = true
+
+            // Also probe JavaScript for high-precision scroll offsets
+            wv?.evaluateJavascript(
+                "(function() { return JSON.stringify({ x: window.pageXOffset || 0, y: window.pageYOffset || 0 }); })();"
+            ) { rawJson ->
+                try {
+                    if (!rawJson.isNullOrBlank() && rawJson != "null") {
+                        val clean = if (rawJson.startsWith("\"") && rawJson.endsWith("\"")) {
+                            org.json.JSONObject(org.json.JSONTokener(rawJson).nextValue().toString())
+                        } else {
+                            org.json.JSONObject(rawJson)
+                        }
+                        val jsX = clean.optInt("x", scrollX)
+                        val jsY = clean.optInt("y", scrollY)
+                        if (jsY > 0) BrowserSession.savedScrollY = jsY
+                        if (jsX > 0) BrowserSession.savedScrollX = jsX
+                    }
+                } catch (_: Throwable) {}
+            }
+
+            // Open discovered media page without killing webpage for super fast instant return
+            showDiscoveredMediaOverlay = true
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            stopBrowserDeepScan()
+        }
+    }
+
+    // Reset to idle state and restore scroll position when returning from discovery page
+    LaunchedEffect(Unit) {
+        if (BrowserSession.pendingScrollRestore && BrowserSession.savedBrowserSite.isNotBlank()) {
+            isDeepScanning = false
+            hasInitiatedScanInStage = false
+            deepScanJob?.cancel()
+            deepScanJob = null
+
+            val targetX = BrowserSession.savedScrollX
+            val targetY = BrowserSession.savedScrollY
+
+            webViewInstance?.let { wv ->
+                wv.postDelayed({
+                    wv.scrollTo(targetX, targetY)
+                    wv.evaluateJavascript("window.scrollTo($targetX, $targetY);", null)
+                }, 100)
+                wv.postDelayed({
+                    wv.scrollTo(targetX, targetY)
+                    wv.evaluateJavascript("window.scrollTo($targetX, $targetY);", null)
+                }, 350)
+                wv.postDelayed({
+                    wv.scrollTo(targetX, targetY)
+                    wv.evaluateJavascript("window.scrollTo($targetX, $targetY);", null)
+                }, 750)
+            }
+            BrowserSession.pendingScrollRestore = false
+        }
+    }
+
+    fun navigateToUrl(target: String) {
+        val trimmed = target.trim()
+        if (trimmed.isBlank()) return
+        stopBrowserDeepScan()
+        hasInitiatedScanInStage = false
+        BrowserSession.pendingScrollRestore = false
+        BrowserSession.savedBrowserSite = ""
+        scrollHandler.show()
+        val formatted = MediaClassifier.formatQueryOrUrl(trimmed)
+        tabSession.clearMedia()
+        DownloaderSession.clear()
+        addressInput = formatted
+        currentUrl = formatted
+        currentPageUrlRef.set(formatted)
+        onUrlChange?.invoke(formatted)
+        tabSession.updateNavigation(formatted, pageTitle)
+        DownloaderSession.updateBrowserPage(formatted)
+        syncCurrentTabWithPage(formatted, pageTitle)
+        coroutineScope.launch {
+            historyManager.recordVisit(formatted)
+        }
+        webViewInstance?.loadUrl(formatted)
+        focusManager.clearFocus()
     }
 
     Surface(
@@ -225,8 +524,9 @@ fun DirectBrowserView(
             .testTag("direct_browser_view"),
         color = BrowserThemeColors.background(isDark)
     ) {
-        // The toolbar is a fixed layout section; webpage content begins below it.
-        Column(modifier = Modifier.fillMaxSize()) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            // The toolbar is a fixed layout section; webpage content begins below it.
+            Column(modifier = Modifier.fillMaxSize()) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -247,10 +547,14 @@ fun DirectBrowserView(
                     }
                 },
                 onDiscoveredMediaClick = {
-                    onOpenDiscoveredMedia?.invoke() ?: onSwitchToMediaTab()
+                    handleDiscoveredMediaClick()
                 },
                 discoveredCount = totalDetectedCount,
+                isDeepScanning = isDeepScanning,
                 onNewTabClick = {
+                    val newId = "tab_${System.currentTimeMillis()}"
+                    val newTab = BrowserTabItem(id = newId, title = "New Tab", url = "")
+                    activeTabId = newId
                     currentUrl = ""
                     addressInput = ""
                     pageTitle = ""
@@ -260,6 +564,9 @@ fun DirectBrowserView(
                     DownloaderSession.clear()
                     scrollHandler.show()
                     webViewInstance?.loadUrl("about:blank")
+                    coroutineScope.launch {
+                        historyManager.saveTabs(tabsList + newTab)
+                    }
                 },
                 onReloadClick = {
                     if (isLoading) webViewInstance?.stopLoading() else webViewInstance?.reload()
@@ -269,6 +576,53 @@ fun DirectBrowserView(
                         coroutineScope.launch {
                             historyManager.addShortcut(pageTitle.ifBlank { currentUrl }, currentUrl)
                         }
+                    }
+                },
+                onSaveToPocket = {
+                    if (currentUrl.isNotBlank()) {
+                        val pocketRepo = com.amresalehin.emregallery.data.PocketRepository.getInstance(context)
+                        val effectiveTitle = pageTitle.ifBlank { webViewInstance?.title ?: currentUrl }
+                        
+                        // Collect all already fetched / discovered media from the active browser session
+                        val currentDetected = tabSession.getDetectedMedia()
+                        val currentDiscovered = DownloaderSession.discoveredItems.value
+                        val allScraped = com.amresalehin.emregallery.data.MediaClassifier
+                            .deduplicateScrapedItems(currentDetected + currentDiscovered)
+                        val alreadyFetchedMediaItems = allScraped.map { scraped ->
+                            com.amresalehin.emregallery.data.MediaInboxItem(
+                                id = scraped.id.ifBlank { "media_${scraped.url.hashCode().toUInt().toString(16)}" },
+                                title = scraped.title.ifBlank { effectiveTitle },
+                                localUri = "",
+                                sourceUrl = scraped.url,
+                                isVideo = scraped.isVideo,
+                                isAudio = scraped.isAudio,
+                                isStream = scraped.isStream,
+                                format = scraped.format,
+                                sizeBytes = scraped.sizeBytes ?: 0L,
+                                dateAddedMillis = scraped.detectedAt.takeIf { it > 0 } ?: System.currentTimeMillis()
+                            )
+                        }
+
+                        // Save bookmark to Pocket directly without preview saving
+                        val bookmark = pocketRepo.addBookmark(
+                            title = effectiveTitle,
+                            url = currentUrl,
+                            description = "",
+                            previewImageUrl = "",
+                            autoFetchMetadata = true,
+                            initialItems = alreadyFetchedMediaItems
+                        )
+
+                        // Run WebView in background and capture all media from page
+                        pocketRepo.startDeepScan(bookmark.id, context)
+
+                        val initialCount = alreadyFetchedMediaItems.size
+                        val message = if (initialCount > 0) {
+                            "Saved to Pocket ($initialCount media) • Capturing all media..."
+                        } else {
+                            "Saved to Pocket • Capturing all media in background..."
+                        }
+                        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
                     }
                 },
                 onShareClick = {
@@ -305,17 +659,19 @@ fun DirectBrowserView(
                 },
                 isWebPage = currentUrl.isNotBlank(),
                 onHomeClick = {
-                    currentUrl = ""
-                    addressInput = ""
-                    pageTitle = ""
-                    onUrlChange?.invoke("")
-                    tabSession.clearMedia()
-                    tabSession.updateNavigation("")
-                    DownloaderSession.clear()
-                    scrollHandler.show()
-                    webViewInstance?.loadUrl("about:blank")
+                    handleBrowserBackNavigation()
                 },
                 onCloseBrowser = onClose,
+                tabCount = tabsList.size,
+                onOpenDownloads = {
+                    onOpenDownloads?.invoke() ?: onSwitchToMediaTab()
+                },
+                onOpenHistory = {
+                    showHistorySheet = true
+                },
+                onOpenTabs = {
+                    showTabsSheet = true
+                },
                 isDark = isDark,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -384,67 +740,28 @@ fun DirectBrowserView(
                     .fillMaxWidth()
             ) {
                 // Interactive WebView (always instantiated for high-speed responsiveness)
-                AndroidView(
-                    factory = { ctx ->
-                        WebView(ctx).apply {
-                            webViewInstance = this
+                key(webViewRecreateEpoch) {
+                    AndroidView(
+                        factory = { ctx ->
+                            WebView(ctx).apply {
+                                webViewInstance = this
+                                BrowserSession.activeWebView = this
                             layoutParams = android.view.ViewGroup.LayoutParams(
                                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                                 android.view.ViewGroup.LayoutParams.MATCH_PARENT
                             )
 
+                            setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
+                                scrollHandler.onScroll(scrollY, oldScrollY)
+                                if (RamGovernor.isHeapLimitExceeded()) {
+                                    RamGovernor.enforceLimit(context, this)
+                                }
+                            }
+
                             setBackgroundColor(if (isDark) android.graphics.Color.parseColor("#111111") else android.graphics.Color.WHITE)
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                                 settings.forceDark = if (isDark) WebSettings.FORCE_DARK_ON else WebSettings.FORCE_DARK_OFF
                             }
-
-                            var startTouchY = 0f
-                            var startTouchX = 0f
-                            var accumulatedTouchDy = 0f
-
-                            setOnTouchListener { _, event ->
-                                when (event.actionMasked) {
-                                    MotionEvent.ACTION_DOWN -> {
-                                        startTouchY = event.rawY
-                                        startTouchX = event.rawX
-                                        accumulatedTouchDy = 0f
-                                    }
-                                    MotionEvent.ACTION_MOVE -> {
-                                        val dy = startTouchY - event.rawY
-                                        val dx = startTouchX - event.rawX
-                                        startTouchY = event.rawY
-                                        startTouchX = event.rawX
-
-                                        if (kotlin.math.abs(dy) > kotlin.math.abs(dx)) {
-                                            if (dy > 0f) {
-                                                if (accumulatedTouchDy < 0f) accumulatedTouchDy = 0f
-                                                accumulatedTouchDy += dy
-                                                if (accumulatedTouchDy >= scrollHandler.thresholdPx) {
-                                                    scrollHandler.hide()
-                                                }
-                                            } else if (dy < 0f) {
-                                                if (accumulatedTouchDy > 0f) accumulatedTouchDy = 0f
-                                                accumulatedTouchDy += dy
-                                                if (accumulatedTouchDy <= -scrollHandler.thresholdPx) {
-                                                    scrollHandler.show()
-                                                }
-                                            }
-                                        }
-                                    }
-                                    MotionEvent.ACTION_UP,
-                                    MotionEvent.ACTION_CANCEL -> {
-                                        accumulatedTouchDy = 0f
-                                        scrollHandler.onTouchEnd()
-                                    }
-                                }
-                                false
-                            }
-
-                            setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
-                                val dy = scrollY - oldScrollY
-                                scrollHandler.onScroll(scrollY, dy)
-                            }
-
                             settings.apply {
                                 javaScriptEnabled = true
                                 domStorageEnabled = true
@@ -456,9 +773,44 @@ fun DirectBrowserView(
                                 displayZoomControls = false
                                 useWideViewPort = true
                                 loadWithOverviewMode = true
-                                mediaPlaybackRequiresUserGesture = false
+                                mediaPlaybackRequiresUserGesture = true
                                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                                 userAgentString = BotDetectionMitigator.STEALTH_USER_AGENT
+                            }
+
+                            setDownloadListener { url, userAgent, contentDisposition, mimetype, contentLength ->
+                                if (!url.isNullOrBlank()) {
+                                    val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
+                                    val isVideo = mimetype?.startsWith("video/", ignoreCase = true) == true ||
+                                        fileName.endsWith(".mp4", ignoreCase = true) || fileName.endsWith(".webm", ignoreCase = true) ||
+                                        fileName.endsWith(".mkv", ignoreCase = true) || fileName.endsWith(".mov", ignoreCase = true)
+                                    val isAudio = mimetype?.startsWith("audio/", ignoreCase = true) == true
+                                    val item = ScrapedMediaItem(
+                                        id = "direct_dl_${System.currentTimeMillis()}_${url.hashCode()}",
+                                        url = url,
+                                        title = fileName,
+                                        isVideo = isVideo,
+                                        isAudio = isAudio,
+                                        category = if (isVideo) MediaCategory.VIDEOS else if (isAudio) MediaCategory.AUDIO else MediaCategory.IMAGES,
+                                        format = mimetype ?: (if (isVideo) "VIDEO" else "MEDIA"),
+                                        sizeBytes = if (contentLength > 0L) contentLength else null,
+                                        provenance = MediaProvenance(
+                                            extractorEngine = "InteractiveBrowser",
+                                            pageUrl = currentUrl
+                                        ),
+                                        downloadHeaders = mapOf(
+                                            "User-Agent" to (userAgent ?: BotDetectionMitigator.STEALTH_USER_AGENT),
+                                            "Referer" to currentUrl
+                                        )
+                                    )
+                                    DownloadQueueManager.enqueueDownload(
+                                        context = context,
+                                        item = item,
+                                        referer = currentUrl,
+                                        sourceUrl = currentUrl
+                                    )
+                                    Toast.makeText(context, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+                                }
                             }
 
                             addJavascriptInterface(
@@ -470,8 +822,6 @@ fun DirectBrowserView(
                                     )
                                     if (item != null) {
                                         tabSession.registerMedia(item)
-                                        onMediaExtracted(item)
-                                        DownloaderSession.addDiscoveredItem(item)
                                     }
                                 },
                                 "EmreBridge"
@@ -487,6 +837,9 @@ fun DirectBrowserView(
                                     pageTitle = title.orEmpty()
                                     onPageTitleChanged?.invoke(pageTitle)
                                     tabSession.updateNavigation(currentUrl, pageTitle)
+                                    if (currentUrl.isNotBlank() && currentUrl != "about:blank") {
+                                        syncCurrentTabWithPage(currentUrl, pageTitle)
+                                    }
                                 }
                             }
 
@@ -590,6 +943,7 @@ fun DirectBrowserView(
                                         isLoading = false
                                         canGoBack = false
                                         canGoForward = false
+                                        syncCurrentTabWithPage("", "Home")
                                         return
                                     }
                                     tabSession.clearMedia()
@@ -597,10 +951,12 @@ fun DirectBrowserView(
                                     isLoading = true
                                     BotDetectionMitigator.injectStealth(view)
                                     currentUrl = url
+                                    currentPageUrlRef.set(url)
                                     addressInput = url
                                     onUrlChange?.invoke(url)
                                     tabSession.updateNavigation(url, pageTitle)
                                     DownloaderSession.updateBrowserPage(url)
+                                    syncCurrentTabWithPage(url, pageTitle)
                                     canGoBack = view?.canGoBack() == true
                                     canGoForward = view?.canGoForward() == true
                                 }
@@ -611,6 +967,7 @@ fun DirectBrowserView(
                                         tabSession.updateNavigation("")
                                         canGoBack = false
                                         canGoForward = false
+                                        syncCurrentTabWithPage("", "Home")
                                         return
                                     }
                                     BotDetectionMitigator.injectStealth(view)
@@ -618,12 +975,29 @@ fun DirectBrowserView(
                                     currentUrl = url
                                     addressInput = url
                                     onUrlChange?.invoke(url)
-                                    tabSession.updateNavigation(url, view?.title)
+                                    val finalTitle = view?.title.orEmpty().ifBlank { pageTitle }
+                                    pageTitle = finalTitle
+                                    tabSession.updateNavigation(url, finalTitle)
+                                    syncCurrentTabWithPage(url, finalTitle)
                                     coroutineScope.launch {
                                         historyManager.recordVisit(url, view?.title)
                                     }
-                                    view?.evaluateJavascript(MediaCaptureEngine.getMutationObserverScript(), null)
-                                    scanCurrentPageDOM(view)
+                                    if (BrowserSession.pendingScrollRestore && BrowserSession.savedBrowserSite.isNotBlank() &&
+                                        url?.equals(BrowserSession.savedBrowserSite, ignoreCase = true) == true) {
+                                        val targetX = BrowserSession.savedScrollX
+                                        val targetY = BrowserSession.savedScrollY
+                                        view?.postDelayed({
+                                            view.scrollTo(targetX, targetY)
+                                            view.evaluateJavascript("window.scrollTo($targetX, $targetY);", null)
+                                        }, 150)
+                                        view?.postDelayed({
+                                            view.scrollTo(targetX, targetY)
+                                            view.evaluateJavascript("window.scrollTo($targetX, $targetY);", null)
+                                        }, 500)
+                                        BrowserSession.pendingScrollRestore = false
+                                        isDeepScanning = false
+                                        hasInitiatedScanInStage = false
+                                    }
                                     canGoBack = view?.canGoBack() == true
                                     canGoForward = view?.canGoForward() == true
                                 }
@@ -635,24 +1009,60 @@ fun DirectBrowserView(
                                     val reqUrl = request?.url?.toString() ?: return null
                                     if (reqUrl.startsWith("about:")) return null
 
+                                    // Do not sniff top-level HTML page navigations as downloadable media
+                                    if (request.isForMainFrame) {
+                                        return if (AdBlockEngine.isAdOrTracker(reqUrl)) {
+                                            AdBlockEngine.createEmptyResponse()
+                                        } else {
+                                            null
+                                        }
+                                    }
+
+                                    val activeBaseUrl = currentPageUrlRef.get()
+                                        .takeIf { it.isNotBlank() && !it.equals("about:blank", ignoreCase = true) }
+                                        ?: reqUrl
+
                                     return MediaCaptureEngine.shouldInterceptRequest(
                                         request = request,
-                                        baseUrl = currentUrl
+                                        baseUrl = activeBaseUrl
                                     ) { item ->
-                                        tabSession.registerMedia(item)
-                                        DownloaderSession.addDiscoveredItem(item)
-                                        onMediaExtracted(item)
+                                        coroutineScope.launch(Dispatchers.Main) {
+                                            tabSession.registerMedia(item)
+                                            onMediaExtracted(item)
+                                        }
                                     }
+                                }
+
+                                override fun onRenderProcessGone(
+                                    view: WebView?,
+                                    detail: RenderProcessGoneDetail?
+                                ): Boolean {
+                                    val didCrash = detail?.didCrash() ?: false
+                                    Log.w("DirectBrowserView", "Chromium renderer process gone (didCrash=$didCrash). Cleanly recovering...")
+                                    try {
+                                        view?.let { wv ->
+                                            (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+                                            wv.destroy()
+                                        }
+                                    } catch (_: Throwable) {}
+                                    if (webViewInstance === view) {
+                                        webViewInstance = null
+                                    }
+                                    RamGovernor.enforceLimit(context, null)
+                                    webViewRecreateEpoch++
+                                    return true
                                 }
                             }
 
-                            if (startUrl.isNotBlank()) {
-                                loadUrl(startUrl)
+                            val initialToLoad = currentUrl.ifBlank { startUrl }
+                            if (initialToLoad.isNotBlank() && initialToLoad != "about:blank") {
+                                loadUrl(initialToLoad)
                             }
                         }
                     },
                     update = { wv ->
                         webViewInstance = wv
+                        BrowserSession.activeWebView = wv
                         wv.setBackgroundColor(if (isDark) android.graphics.Color.parseColor("#111111") else android.graphics.Color.WHITE)
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             wv.settings.forceDark = if (isDark) WebSettings.FORCE_DARK_ON else WebSettings.FORCE_DARK_OFF
@@ -660,9 +1070,13 @@ fun DirectBrowserView(
                     },
                     onRelease = { wv ->
                         wv.stopLoading()
+                        wv.loadUrl("about:blank")
+                        wv.onPause()
                         wv.webViewClient = WebViewClient()
                         wv.webChromeClient = WebChromeClient()
-                        wv.destroy()
+                        wv.post {
+                            try { wv.destroy() } catch (_: Throwable) {}
+                        }
                         if (webViewInstance === wv) {
                             webViewInstance = null
                         }
@@ -671,6 +1085,7 @@ fun DirectBrowserView(
                         .fillMaxSize()
                         .testTag("browser_webview_canvas")
                 )
+            }
 
                 // 2. Minimalist Monochrome Mobile Browser Home Layout (blank when empty)
                 if (currentUrl.isBlank()) {
@@ -687,50 +1102,32 @@ fun DirectBrowserView(
                             .testTag("browser_empty_home_page")
                     )
                 }
-
-                // 3. Floating Bottom Action Bar with auto-hide slide-and-fade animation
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = scrollHandler.isVisible,
-                    enter = slideInVertically(
-                        initialOffsetY = { fullHeight -> fullHeight },
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioNoBouncy,
-                            stiffness = Spring.StiffnessMediumLow
-                        )
-                    ) + fadeIn(animationSpec = tween(durationMillis = 200)),
-                    exit = slideOutVertically(
-                        targetOffsetY = { fullHeight -> fullHeight },
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioNoBouncy,
-                            stiffness = Spring.StiffnessMediumLow
-                        )
-                    ) + fadeOut(animationSpec = tween(durationMillis = 200)),
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .wrapContentHeight()
-                ) {
-                    BrowserBottomNavBar(
-                        tabCount = tabsList.size,
-                        onOpenDownloads = {
-                            onOpenDownloads?.invoke() ?: onSwitchToMediaTab()
-                        },
-                        onOpenHistory = {
-                            showHistorySheet = true
-                        },
-                        onOpenTabs = {
-                            showTabsSheet = true
-                        },
-                        onOpenBrowserSettings = {
-                            showSettingsSheet = true
-                        },
-                        isDark = isDark,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
             }
         }
+
+        // Fullscreen Discovered Media Overlay (keeps underlying WebView alive for instant return & deep scanning)
+        if (showDiscoveredMediaOverlay) {
+            DiscoveredMediaPage(
+                onBack = {
+                    showDiscoveredMediaOverlay = false
+                    stopBrowserDeepScan()
+                    hasInitiatedScanInStage = false
+                },
+                onDeepScanClick = {
+                    if (isDeepScanning) {
+                        stopBrowserDeepScan()
+                    } else {
+                        startBrowserDeepScan()
+                    }
+                },
+                isDeepScanning = isDeepScanning,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(100f)
+            )
+        }
     }
+}
 
     // Modal Dialogs & Sheets
     if (showAddShortcutDialog) {
@@ -786,31 +1183,79 @@ fun DirectBrowserView(
         BrowserTabsBottomSheet(
             tabs = tabsList,
             currentUrl = currentUrl,
+            activeTabId = activeTabId,
             onSelectTab = { tab ->
+                activeTabId = tab.id
+                currentUrl = tab.url
+                addressInput = tab.url
+                pageTitle = tab.title
+                onUrlChange?.invoke(tab.url)
+                tabSession.clearMedia()
+                tabSession.updateNavigation(tab.url, tab.title)
+                DownloaderSession.clear()
+                scrollHandler.show()
                 if (tab.url.isNotBlank()) {
-                    navigateToUrl(tab.url)
+                    webViewInstance?.loadUrl(tab.url)
                 } else {
-                    currentUrl = ""
-                    addressInput = ""
-                    pageTitle = ""
                     webViewInstance?.loadUrl("about:blank")
                 }
             },
             onCloseTab = { tabId ->
                 val remaining = tabsList.filter { it.id != tabId }
-                coroutineScope.launch {
-                    historyManager.saveTabs(remaining)
+                if (remaining.isEmpty()) {
+                    val freshId = "tab_${System.currentTimeMillis()}"
+                    val freshTab = BrowserTabItem(id = freshId, title = "New Tab", url = "")
+                    activeTabId = freshId
+                    currentUrl = ""
+                    addressInput = ""
+                    pageTitle = ""
+                    onUrlChange?.invoke("")
+                    tabSession.clearMedia()
+                    tabSession.updateNavigation("")
+                    DownloaderSession.clear()
+                    scrollHandler.show()
+                    webViewInstance?.loadUrl("about:blank")
+                    coroutineScope.launch {
+                        historyManager.saveTabs(listOf(freshTab))
+                    }
+                } else {
+                    if (activeTabId == tabId) {
+                        val nextTab = remaining.last()
+                        activeTabId = nextTab.id
+                        currentUrl = nextTab.url
+                        addressInput = nextTab.url
+                        pageTitle = nextTab.title
+                        onUrlChange?.invoke(nextTab.url)
+                        tabSession.clearMedia()
+                        tabSession.updateNavigation(nextTab.url, nextTab.title)
+                        DownloaderSession.clear()
+                        scrollHandler.show()
+                        if (nextTab.url.isNotBlank()) {
+                            webViewInstance?.loadUrl(nextTab.url)
+                        } else {
+                            webViewInstance?.loadUrl("about:blank")
+                        }
+                    }
+                    coroutineScope.launch {
+                        historyManager.saveTabs(remaining)
+                    }
                 }
             },
             onNewTab = {
+                val newId = "tab_${System.currentTimeMillis()}"
+                val newTab = BrowserTabItem(id = newId, title = "New Tab", url = "")
+                activeTabId = newId
                 currentUrl = ""
                 addressInput = ""
                 pageTitle = ""
                 onUrlChange?.invoke("")
+                tabSession.clearMedia()
+                tabSession.updateNavigation("")
+                DownloaderSession.clear()
+                scrollHandler.show()
                 webViewInstance?.loadUrl("about:blank")
-                val newTabs = tabsList + BrowserTabItem("tab_${System.currentTimeMillis()}", "New Tab", "")
                 coroutineScope.launch {
-                    historyManager.saveTabs(newTabs)
+                    historyManager.saveTabs(tabsList + newTab)
                 }
             },
             onDismiss = { showTabsSheet = false },

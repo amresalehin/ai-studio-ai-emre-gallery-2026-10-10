@@ -736,25 +736,25 @@ fun OverviewTabContent(
     onFaceClick: ((DetectedMediaFace) -> Unit)? = null,
     selectedEngineId: String = BuffaloLFaceEngine.ENGINE_ID,
     onSelectEngine: (String) -> Unit = {},
-    onAutoTagAi: (() -> Unit)? = null,
-    isAiTagging: Boolean = false,
-    aiTaggingStatus: String? = null,
     onRemoveTag: ((String) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     var metadataExpanded by remember { mutableStateOf(true) }
 
+    val cachedLocation = remember(item.uri) {
+        com.amresalehin.emregallery.data.PhotoMapLocationCache(context).getLocation(item.uri)
+    }
     val hasTags = customTags.isNotEmpty()
     val hasPeople = detectedFaces.isNotEmpty()
-    val hasLocation = metadata["location"]?.isNotBlank() == true || metadata.containsKey("latitude")
+    val hasLocation = metadata["location"]?.isNotBlank() == true || metadata.containsKey("latitude") || cachedLocation != null
     val assignedAlbums = remember(item.uri, customAlbums) {
         customAlbums.filter { item.uri in it.mediaUris }
     }
 
     // Readable place split into primary and secondary
     val rawLocation = metadata["location"].orEmpty()
-    val (primaryLocation, secondaryLocation) = remember(rawLocation, metadata["latitude"], metadata["longitude"]) {
+    val (primaryLocation, secondaryLocation) = remember(rawLocation, metadata["latitude"], metadata["longitude"], cachedLocation) {
         if (rawLocation.isNotBlank()) {
             val parts = rawLocation.split(",").map { it.trim() }.filter { it.isNotEmpty() }
             when {
@@ -766,6 +766,8 @@ fun OverviewTabContent(
             val lat = metadata["latitude"]?.toDoubleOrNull() ?: 0.0
             val lon = metadata["longitude"]?.toDoubleOrNull() ?: 0.0
             "%.4f°, %.4f°".format(lat, lon) to "GPS coordinates"
+        } else if (cachedLocation?.point != null) {
+            "%.4f°, %.4f°".format(java.util.Locale.US, cachedLocation.point.latitude, cachedLocation.point.longitude) to "In-app map location"
         } else {
             "" to ""
         }
@@ -878,82 +880,19 @@ fun OverviewTabContent(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface
                     )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    IconButton(
+                        onClick = onAddTag,
+                        modifier = Modifier
+                            .size(32.dp)
+                            .testTag("add_tag_manual_button")
                     ) {
-                        Surface(
-                            onClick = { onAutoTagAi?.invoke() },
-                            shape = CircleShape,
-                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
-                            modifier = Modifier
-                                .height(32.dp)
-                                .testTag("ai_auto_tag_button")
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 11.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(5.dp)
-                            ) {
-                                if (isAiTagging) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(13.dp),
-                                        strokeWidth = 1.6.dp,
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
-                                    Text(
-                                        text = "Tagging...",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontSize = 11.5.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-                                    )
-                                } else {
-                                    Icon(
-                                        imageVector = Icons.Default.AutoAwesome,
-                                        contentDescription = "Auto-tag with AI",
-                                        modifier = Modifier.size(13.dp),
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
-                                    Text(
-                                        text = "AI Tag",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontSize = 11.5.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-                                    )
-                                }
-                            }
-                        }
-
-                        IconButton(
-                            onClick = onAddTag,
-                            modifier = Modifier
-                                .size(32.dp)
-                                .testTag("add_tag_manual_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Add,
-                                contentDescription = "Add tag manually",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "Add tag manually",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
+                        )
                     }
-                }
-
-                if (!aiTaggingStatus.isNullOrBlank()) {
-                    Text(
-                        text = aiTaggingStatus,
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            color = MaterialTheme.colorScheme.primary,
-                            fontSize = 11.sp
-                        ),
-                        modifier = Modifier.padding(horizontal = 2.dp)
-                    )
                 }
 
                 if (hasTags) {
@@ -1002,44 +941,21 @@ fun OverviewTabContent(
                         }
                     }
                 } else {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.6f),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)),
+                        modifier = Modifier
+                            .clickable { onAddTag() }
+                            .testTag("empty_manual_add_tag_button")
                     ) {
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)),
-                            modifier = Modifier
-                                .clickable { onAutoTagAi?.invoke() }
-                                .testTag("empty_ai_tag_button")
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
-                                Spacer(Modifier.width(6.dp))
-                                Text(if (isAiTagging) "Tagging..." else "Auto-tag with AI", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
-                            }
-                        }
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.6f),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)),
-                            modifier = Modifier
-                                .clickable { onAddTag() }
-                                .testTag("empty_manual_add_tag_button")
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Spacer(Modifier.width(6.dp))
-                                Text("Add manually", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Add tag", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
@@ -1172,42 +1088,86 @@ fun OverviewTabContent(
                 }
                 if (hasLocation) {
                     DetailCard(onClick = onOpenMap) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(44.dp)
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
-                                contentAlignment = Alignment.Center
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(
-                                    Icons.Default.LocationOn,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.onSurface,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = primaryLocation,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                if (secondaryLocation.isNotBlank()) {
-                                    Spacer(Modifier.height(2.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        Icons.Default.LocationOn,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onSurface,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                Spacer(Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = secondaryLocation,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        text = primaryLocation,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
+                                    )
+                                    if (secondaryLocation.isNotBlank()) {
+                                        Spacer(Modifier.height(2.dp))
+                                        Text(
+                                            text = secondaryLocation,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+
+                            val prov = cachedLocation?.provenance
+                            if (prov != null) {
+                                Spacer(Modifier.height(10.dp))
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                                Spacer(Modifier.height(8.dp))
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    LocationProvenanceRow(
+                                        label = "Location Source",
+                                        value = when {
+                                            prov.source?.contains("exif", ignoreCase = true) == true -> "EXIF Metadata"
+                                            else -> prov.source ?: "Unknown source"
+                                        }
+                                    )
+                                    LocationProvenanceRow(
+                                        label = "Match Method",
+                                        value = when (prov.matchMethod?.lowercase()) {
+                                            "interpolated" -> "Interpolated path"
+                                            "staypoint" -> "Staypoint visit"
+                                            "nearest" -> "Nearest sample"
+                                            "existing_exif" -> "Existing EXIF"
+                                            else -> prov.matchMethod ?: "Matched"
+                                        }
+                                    )
+                                    if (prov.sampleGapMinutes != null && prov.sampleGapMinutes > 0.0) {
+                                        LocationProvenanceRow(
+                                            label = "Sample Gap",
+                                            value = "%.1f min".format(java.util.Locale.US, prov.sampleGapMinutes)
+                                        )
+                                    }
+                                    if (!prov.timestampSource.isNullOrBlank()) {
+                                        LocationProvenanceRow(
+                                            label = "Timestamp Source",
+                                            value = prov.timestampSource
+                                        )
+                                    }
+                                    LocationProvenanceRow(
+                                        label = "EXIF Status",
+                                        value = if (prov.exifWritten) "Saved to file EXIF" else "In-app map only (File untouched)"
                                     )
                                 }
                             }
@@ -1452,9 +1412,6 @@ fun ActionsTabContent(
     onAddTagClick: (() -> Unit)? = null,
     onRescanPhoto: (() -> Unit)? = null,
     onAddPersonClick: (() -> Unit)? = null,
-    onAutoTagAi: (() -> Unit)? = null,
-    isAiTagging: Boolean = false,
-    aiTaggingStatus: String? = null,
     onRemoveTag: ((String) -> Unit)? = null,
     modifier: Modifier = Modifier,
     listState: androidx.compose.foundation.lazy.LazyListState = androidx.compose.foundation.lazy.rememberLazyListState()
@@ -1523,9 +1480,9 @@ fun ActionsTabContent(
             }
         }
 
-        // 2. AI Image Tagging Card (Images only)
+        // 2. Photo Tags Card (Images only)
         if (!item.isVideo) {
-            item(key = "actions_ai_tagging") {
+            item(key = "actions_tags") {
                 Surface(
                     shape = RoundedCornerShape(16.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -1547,40 +1504,32 @@ fun ActionsTabContent(
                             ) {
                                 Surface(
                                     shape = CircleShape,
-                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                    color = MaterialTheme.colorScheme.secondaryContainer,
                                     modifier = Modifier.size(32.dp)
                                 ) {
                                     Box(contentAlignment = Alignment.Center) {
                                         Icon(
-                                            Icons.Default.AutoAwesome,
+                                            Icons.Default.Label,
                                             contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
                                             modifier = Modifier.size(16.dp)
                                         )
                                     }
                                 }
                                 Column {
                                     Text(
-                                        text = "AI Image Tagging",
+                                        text = "Photo Tags",
                                         style = MaterialTheme.typography.titleMedium,
                                         fontWeight = FontWeight.SemiBold,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
-                                        text = "Detect objects, themes & scene attributes",
+                                        text = "Organize photos with custom labels",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             }
-                        }
-
-                        if (!aiTaggingStatus.isNullOrBlank()) {
-                            Text(
-                                text = aiTaggingStatus,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (aiTaggingStatus.startsWith("Error")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-                            )
                         }
 
                         // Existing tags if any
@@ -1625,46 +1574,18 @@ fun ActionsTabContent(
                             }
                         }
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
+                        if (onAddTagClick != null) {
                             Button(
-                                onClick = { onAutoTagAi?.invoke() },
-                                enabled = !isAiTagging,
+                                onClick = onAddTagClick,
                                 shape = RoundedCornerShape(20.dp),
                                 modifier = Modifier
-                                    .weight(1f)
+                                    .fillMaxWidth()
                                     .defaultMinSize(minHeight = 44.dp)
-                                    .testTag("action_auto_tag_ai_button")
+                                    .testTag("action_add_tag_manual_button")
                             ) {
-                                if (isAiTagging) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(16.dp),
-                                        strokeWidth = 2.dp,
-                                        color = MaterialTheme.colorScheme.onPrimary
-                                    )
-                                    Spacer(Modifier.width(8.dp))
-                                    Text("Analyzing...")
-                                } else {
-                                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("Auto-Tag with AI")
-                                }
-                            }
-
-                            if (onAddTagClick != null) {
-                                OutlinedButton(
-                                    onClick = onAddTagClick,
-                                    shape = RoundedCornerShape(20.dp),
-                                    modifier = Modifier
-                                        .defaultMinSize(minHeight = 44.dp)
-                                        .testTag("action_add_tag_manual_button")
-                                ) {
-                                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("Add Tag")
-                                }
+                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Add Tag")
                             }
                         }
                     }
@@ -2431,6 +2352,27 @@ fun FfmpegVideoToolsSection(
                 fontWeight = FontWeight.Medium
             )
         }
+    }
+}
+
+@Composable
+private fun LocationProvenanceRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
     }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "Emre Gallery",
-  "description": "Smart media gallery, viewer, offline photo map, OCR, face recognition, and media downloader with FFmpeg integration.",
+  "description": "Android media gallery, downloader, and pocket vault with face recognition, OCR, and photo map",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
